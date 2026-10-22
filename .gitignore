@@ -8,3 +8,5 @@ __pycache__/
 /excamera-base/
 /excamera-e*/
 /excamera-work/
+# Mixamo downloads: their license forbids redistributing the raw files; only the converted clips.bin ships
+/crawlers/mocap-src/
