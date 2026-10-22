@@ -31,11 +31,12 @@ return {
     burn_gain = 4,
     burn_heal = 900,
     burn_mend = 0.5,
-    -- Severing (arms): a cut this hard to an upper arm, forearm or hand takes the limb off at the
-    -- shoulder or elbow, if the runtime can cut the joint; the stump then bleeds for sever_bleed seconds.
+    -- Severing: a chop (injuries.chop: the blow, the blade's edge and weight, the limb's thickness and
+    -- its earlier wounds) this hard takes the limb off at the shoulder, elbow, hip or knee, if the
+    -- runtime can cut the joint; the stump then bleeds for sever_bleed seconds.
     sever = true,
-    -- PROVISIONAL(2026-10-22, 0.35 never triggered in Hunter's fights and no hit-damage
-    -- figures are recorded yet; ratify-by: 2026-10-29): a hard cut, about twice the cut threshold.
+    -- PROVISIONAL(2026-10-22, no hit-damage figures recorded yet; ratify-by: 2026-10-29): a typical
+    -- sword's hard cut to a fresh forearm (0.2 health) just does it; a dagger never does.
     sever_at = 0.22,
     sever_bleed = 40,
     notices = true,

@@ -226,8 +226,9 @@ events.on("character.hit", function(hit)
         if who[target] ~= nil and who[target] ~= hit.record_id then forget(target) end   -- a new body on an old row
         who[target] = hit.record_id
     end
-    local blunt = injuries.blunt(hit, weapon_of(hit.weapon_id))
-    if not blunt and (hit.health_damage or 0) >= cfg.sever_at and sever(target, hit.part) then
+    local weapon = weapon_of(hit.weapon_id)
+    local blunt = injuries.blunt(hit, weapon)
+    if not blunt and injuries.chop(target, hit.part, hit.health_damage, weapon) >= cfg.sever_at and sever(target, hit.part) then
         if hit.is_player then
             say("Your " .. readable(hit.part) .. " is cut off.")
             save_player()

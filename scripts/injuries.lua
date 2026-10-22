@@ -34,6 +34,35 @@ function M.blunt(hit, weapon)
     return (grip.crush or 0) > math.max(grip.cut or 0, grip.point or 0)
 end
 
+-- How hard a cut chops through a limb, compared with cfg.sever_at. A blade takes a limb off when its
+-- edge, its weight and the blow together beat the limb's thickness:
+-- * the blow: this hit's health damage (after armour) plus half the damage this part has already
+--   taken since its last rest;
+-- * the edge: no edge (cut under 0.2, the game's own grip numbers) never severs; a blunt blow never does;
+-- * the weight: heft against a typical one-handed sword (0.45): a dagger chops at a third, a two-handed
+--   sword or axe at about 1.3;
+-- * the limb: a wrist or ankle goes easily, a forearm or shin less, an upper arm or thigh hardly;
+-- * earlier wounds: a part already cut through the muscle chops easier by its severity, a broken
+--   bone by 1.4 more.
+M.CHOP_PART = {[17] = 1.6, [18] = 1.6, [13] = 1.15, [16] = 1.15, [12] = 0.75, [15] = 0.75,
+               [4] = 1.3, [7] = 1.3, [3] = 0.9, [6] = 0.9, [2] = 0.55, [5] = 0.55}
+function M.chop(target, part, damage, weapon)
+    local limb = M.CHOP_PART[part]
+    if not limb or not damage or damage <= 0 then return 0 end
+    local edge, heft = 1, 1
+    if weapon then
+        local cut = math.max(weapon.grip and weapon.grip.cut or 0, weapon.alternate_grip and weapon.alternate_grip.cut or 0)
+        if cut < 0.2 then return 0 end
+        edge = clamp(cut / 0.4, 0.6, 1.25)
+        heft = clamp((weapon.heft or 0.45) / 0.45, 0.3, 1.6)
+    end
+    local blow = damage + 0.5 * ((strain[target] or {})[part] or 0)
+    local wound = 1
+    local old = (injuries[target] or {})[part]
+    if old then wound = 1 + old.severity * (old.kind == "broken" and 1.4 or 1) end
+    return blow * edge * heft * limb * wound
+end
+
 -- One hit. Returns the new or worsened injury as {part, kind, severity, new}, or nil.
 function M.hit(target, part, damage, blunt, now)
     last_hit[target] = now

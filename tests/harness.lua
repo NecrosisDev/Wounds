@@ -38,7 +38,9 @@ local function new(opts)
         end,
     }
     env.items = {stats = function(id)
-        if id == 1 then return {weapon = {grip = {cut = 0.8, crush = 0.2, point = 0.3}}} end   -- a sword
+        if id == 1 then return {weapon = {heft = 0.45, grip = {cut = 0.8, crush = 0.2, point = 0.3}}} end   -- a sword
+        if id == 3 then return {weapon = {heft = 0.15, grip = {cut = 0.3, crush = 0, point = 0}}} end  -- a dagger
+        if id == 4 then return {weapon = {heft = 0.6, grip = {cut = 0.43, crush = 0, point = 0}}} end  -- a two-handed sword
         if id == 2 then return {weapon = {grip = {cut = 0, crush = 0.9, point = 0}}} end      -- a mace
     end}
     env.save_data = {get = function() return s.save end, set = function(t) assert(#t <= 4096) s.save = t return true end}
@@ -347,6 +349,26 @@ local y = new({save = x.save})
 y.fire("runtime.phase", {phase = "session"})
 y.run_afters()
 assert(y.cuts[1] == "player:16", "cut again after a reload")
+
+-- What it takes: a dagger never chops a limb off; a sword needs a hard cut to a fresh forearm but less
+-- to one already cut; an upper arm takes a heavy blade.
+local ch = new()
+ch.fire("runtime.phase", {phase = "session"})
+ch.fire("character.hit", hit(13, 0.6, 3, {handle = 70}))    -- dagger, very hard
+ch.run_afters()
+assert(#ch.cuts == 0, "a dagger never severs")
+ch.fire("character.hit", hit(16, 0.15, 1, {handle = 70}))   -- sword, a fair cut to the left forearm: cut, not off
+ch.run_afters()
+assert(#ch.cuts == 0, "a fair cut to a fresh forearm stays on")
+ch.fire("character.hit", hit(16, 0.15, 1, {handle = 70}))   -- the same again on the cut forearm: off
+ch.run_afters()
+assert(ch.cuts[1] == "h70:16", "the cut forearm goes: " .. tostring(ch.cuts[1]))
+ch.fire("character.hit", hit(12, 0.22, 1, {handle = 70}))   -- sword, upper arm: stays on
+ch.run_afters()
+assert(#ch.cuts == 1, "an upper arm holds against a sword cut")
+ch.fire("character.hit", hit(12, 0.22, 4, {handle = 70}))   -- two-handed sword: off at the shoulder
+ch.run_afters()
+assert(ch.cuts[2] == "h70:12", "a heavy blade takes the upper arm: " .. tostring(ch.cuts[2]))
 
 -- Legs: off at the knee, kept on the ground; without keep_down a leg is never cut.
 local lg = new()
