@@ -1,0 +1,432 @@
+diff --git src/mod/stone_skin.inl src/mod/stone_skin.inl
+index 0761121..e1eed65 100644
+--- src/mod/stone_skin.inl
++++ src/mod/stone_skin.inl
+@@ -178,6 +178,10 @@ static bool skinFacesEmit(const WearPlan& plan, bool bind, const unsigned char*
+             for (unsigned f = 0; f < plan.count;) {
+                 unsigned end = f + 1;
+                 while (end < plan.count && stone[end] == stone[f]) ++end;
++                if (stone[f] == 2) { // left out: a severed limb's torn band (wounds_bake.inl)
++                    f = end;
++                    continue;
++                }
+                 if (bool(stone[f]) != swapped) {
+                     s.bind(0, units, stone[f] ? replacement : originals);
+                     swapped = stone[f] != 0;
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index f3ce80c..a2ad83a 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -87,7 +87,9 @@ struct WoundUniforms {
+     unsigned drips = 0;      // blood drops on the floor, below
+     bool burning = false;    // a character in view is burnt (the skin bake has work)
+     float d[woundDripShown][4]; // a drop: view-space point it fell from; w: radius (cm) + 10 x dryness step (0..9)
+-    bool any() const { return count || drips || burning; }
++    unsigned caps = 0;          // flesh caps on severed limbs: stump and end
++    float capA[8][4], capB[8][4]; // centre (view space), radius (cm); facing (view space), 0 stump / 1 the severed end
++    bool any() const { return count || drips || burning || caps; }
+     float a[woundShownLimit][4]; // centre; w: half length, cm (a bruise's radius)
+     float b[woundShownLimit][4]; // the blade's path, unit; w: kind
+     float c[woundShownLimit][4]; // severity 0..1, seed, half width (cm), blood run length (cm)
+@@ -111,6 +113,15 @@ static float woundLevelOf(const WoundBurn* table, int count, uintptr_t actor) {
+     return 0.f;
+ }
+ static float woundBurnLevel(uintptr_t actor) { return woundLevelOf(woundBurns, woundBurnCount, actor); }
++// Injuries' "injuries.severed": one bit per limb bone cut off (the "injuries.broken" bits); woundLock.
++static WoundBurn woundSevered[64];
++static int woundSeveredCount = 0;
++static uint32_t woundSeveredBits(uintptr_t actor) {
++    for (int b = 0; b < woundSeveredCount; ++b)
++        if (woundSevered[b].actor == actor) return woundSevered[b].level;
++    return 0;
++}
++static void woundSeveredCaps(const float* view, WoundUniforms& out); // wounds_bake.inl
+ static float woundBurnScar(uintptr_t actor) { return woundLevelOf(woundBurnScars, woundBurnScarCount, actor); }
+ // One mark's levels into its table; a change of 4/255 or more anywhere re-bakes the skins.
+ static void woundReadLevels(int (*marks)(const char*, uintptr_t*, uint32_t*, int), const char* name, WoundBurn* table,
+@@ -449,6 +460,7 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+     if (const WoundMarkNodes marks = woundMarkExport()) {
+         woundReadLevels(marks, "injuries.burn", woundBurns, woundBurnCount);
+         woundReadLevels(marks, "injuries.burnscar", woundBurnScars, woundBurnScarCount);
++        woundReadLevels(marks, "injuries.severed", woundSevered, woundSeveredCount);
+     }
+     out.burning = woundBurnCount > 0 || woundBurnScarCount > 0;
+     const float fadeDt = woundFadeTick ? (std::min)(float(now - woundFadeTick) / 1000.f, 0.5f) : 0.f;
+@@ -630,5 +642,6 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         memcpy(out.d[k], v, sizeof v);
+     }
+     out.drips = dripCount;
++    woundSeveredCaps(view, out);
+     ReleaseSRWLockExclusive(&woundLock);
+ }
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index ac16aea..c38096f 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -1152,6 +1152,9 @@ uniform float woundCount;
+ uniform vec4 woundRect;    // screen box (uv min xy, max zw) that holds every wound's reach; outside it nothing to do
+ uniform vec4 dripA[24];    // a drop of blood: view-space point it fell from; w: radius (cm) + 10 x dryness step (0..9)
+ uniform float dripCount;
++uniform vec4 capA[8];      // a flesh cap on a severed limb: view-space centre; w: radius (cm)
++uniform vec4 capB[8];      // its facing (view space); w: 0 the stump, 1 the severed end
++uniform float capCount;
+ 
+ float woundHash(float x) {
+     return fract(sin(x * 12.9898) * 43758.5453);
+@@ -1159,9 +1162,42 @@ float woundHash(float x) {
+ 
+ // Wounds (wounds.inl) on the surface where they landed. They multiply the light already there, so a
+ // wound in shadow stays in shadow; only wet blood adds a little shine, scaled by that same light.
++// A severed limb's cap where the view ray meets it in front of the scene: raw flesh around a pale bone
++// with its marrow, a rim of skin and fat, lit from above and scaled by the skin's light around it.
++// Opaque; 0 coverage elsewhere.
++vec4 capAt(vec3 p) {
++    vec3 ray = normalize(p);
++    for (int k = 0; k < 8; ++k) {
++        if (float(k) >= capCount) break;
++        vec4 A = capA[k], B = capB[k];
++        float facing = dot(ray, B.xyz);
++        if (abs(facing) < 1e-3) continue;
++        float t = dot(A.xyz, B.xyz) / facing;
++        if (t <= 0.0 || t > length(p) + 2.0) continue; // behind the camera, or the scene stands in front
++        vec3 hit = ray * t - A.xyz;
++        float r = length(hit) / A.w;
++        if (r > 1.0) continue;
++        vec3 n = facing < 0.0 ? B.xyz : -B.xyz;
++        vec3 flesh = mix(vec3(0.45, 0.06, 0.05), vec3(0.32, 0.03, 0.03), smoothstep(0.3, 0.8, sin(hit.x * 1.7) * sin(hit.y * 2.3) * 0.5 + 0.5));
++        vec3 c = mix(flesh, vec3(0.78, 0.6, 0.45), smoothstep(0.82, 0.95, r));         // skin and fat at the rim
++        c = mix(c, vec3(0.85, 0.8, 0.68), 1.0 - smoothstep(0.24, 0.3, r));             // the bone
++        c = mix(c, vec3(0.35, 0.08, 0.06), 1.0 - smoothstep(0.09, 0.13, r));           // its marrow
++        vec3 side = normalize(cross(B.xyz, abs(B.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
++        float around = dot(toLight(texture2D(sceneTex, project(A.xyz + side * A.w * 1.4)).rgb), vec3(0.2126, 0.7152, 0.0722));
++        vec3 lightDir = normalize(worldUp.xyz * 0.8 + vec3(0.0, 0.0, 0.6));
++        float shade = 0.35 + 0.65 * max(dot(n, lightDir), 0.0);
++        return vec4(toStored(clamp(c * shade * min(around * 2.5 + 0.02, 1.2), 0.0, 1.0)), 1.0);
++    }
++    return vec4(0.0);
++}
++
+ vec3 woundMarks(vec3 color) {
+     if (uv.x < woundRect.x || uv.y < woundRect.y || uv.x > woundRect.z || uv.y > woundRect.w) return color;
+     float raw = texture2D(depthTex, uv).r;
++    if (capCount > 0.0) {
++        vec4 cap = capAt(viewPosition(uv, min(raw, skyDepth)));
++        if (cap.a > 0.0) return cap.rgb;
++    }
+     if (raw >= skyDepth) return color;
+     vec3 p = viewPosition(uv, raw);
+     vec3 n = vec3(0.0, 0.0, 1.0);
+@@ -1446,7 +1482,7 @@ enum ViewUniform : unsigned {
+     uFrameOffset, uCurrent, uHistory, uToPrevious, uPreviousProjection, uHistoryWeight, uDofHalf, uCells, uExposure,
+     uSilhouette, uSilhouetteOn, uHeldDetail, uHeldNoise, uHeldData, uLevelDetail, uLevelRow0, uLevelRow1, uLevelRow2, uLevelPeople,
+     uWoundA, uWoundB, uWoundC, uWoundCount, uWoundRect, uDripA, uDripCount,
+-    uFireA, uFireB, uFireC, uFireCount, uFireRect, uFireLook, uFireRight, uFireNoise, viewUniformCount
++    uFireA, uFireB, uFireC, uFireCount, uFireRect, uFireLook, uFireRight, uFireNoise, uCapA, uCapB, uCapCount, viewUniformCount
+ };
+ static const char* const viewUniformNames[viewUniformCount] = {
+     "sceneTex", "depthTex", "texel", "projection", "depthLinear", "pixelScale", "encoded",
+@@ -1455,7 +1491,7 @@ static const char* const viewUniformNames[viewUniformCount] = {
+     "frameOffset", "current", "history", "toPrevious", "previousProjection", "historyWeight", "dofHalf", "cells", "exposure",
+     "silhouette", "silhouetteOn", "heldDetail", "heldNoise", "heldData", "levelDetail", "levelRow0", "levelRow1", "levelRow2", "levelPeople",
+     "woundA", "woundB", "woundC", "woundCount", "woundRect", "dripA", "dripCount",
+-    "fireA", "fireB", "fireC", "fireCount", "fireRect", "fireLook", "fireRight", "fireNoise"};
++    "fireA", "fireB", "fireC", "fireCount", "fireRect", "fireLook", "fireRight", "fireNoise", "capA", "capB", "capCount"};
+ struct ViewProgramUniforms { GLint at[viewUniformCount]; };
+ enum ViewProgram : unsigned {
+     programAo, programSsr, programDof, programFinish, programComposite, programResolve, programDofComposite,
+@@ -2532,7 +2568,7 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+          "eye adaptation meter"},
+         {float(aoMode || ssrMode), &r.distanceProgram, &owner->distanceAttempted, nullptr, distanceShader,
+          viewDistanceFailed, "half-resolution distances"},
+-        {float(finishMode && (request.wounds.count || request.wounds.drips)), &r.woundProgram, &owner->woundAttempted, nullptr, woundShader,
++        {float(finishMode && (request.wounds.count || request.wounds.drips || request.wounds.caps)), &r.woundProgram, &owner->woundAttempted, nullptr, woundShader,
+          viewWoundsFailed, "wound marks"},
+         {float(finishMode && request.fires.count), &r.fireProgram, &owner->fireAttempted, nullptr, fireShader,
+          viewFireFailed, "fire and smoke"}};
+@@ -2979,7 +3015,8 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+         }
+         stampTo(4);
+         // Wound marks first, on the image the finishing pass reads, only inside their screen box.
+-        if (finishMode && (request.wounds.count || request.wounds.drips) && r.woundProgram && g.uniform4fv && projection.worldUpValid &&
++        if (finishMode && (request.wounds.count || request.wounds.drips || request.wounds.caps) && r.woundProgram && g.uniform4fv &&
++            projection.worldUpValid &&
+             (source == r.viewColor || source == r.chainTex) && woundPassReady(g, r)) {
+             const WoundUniforms& wounds = request.wounds;
+         // The screen box of every wound's reach (centre +- half length + runs + 6 cm, as the shader
+@@ -2996,6 +3033,18 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+             box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
+             box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
+         }
++        // Each cap's disc.
++        for (unsigned k = 0; k < wounds.caps && box[2] - box[0] < 1.f; ++k) {
++            const float* c = wounds.capA[k];
++            const float reach = c[3] * 1.5f, depth = -c[2];
++            if (!(depth - reach > 1.f)) { box[0] = box[1] = 0.f; box[2] = box[3] = 1.f; break; }
++            const float sx = (projection.p0 * c[0] / depth - projection.p8) * 0.5f + 0.5f;
++            const float sy = (projection.p5 * c[1] / depth - projection.p9) * 0.5f + 0.5f;
++            const float rx = std::abs(projection.p0) * reach / (depth - reach) * 0.5f;
++            const float ry = std::abs(projection.p5) * reach / (depth - reach) * 0.5f;
++            box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
++            box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
++        }
+         // Each drop's reach: from 20 to 200 cm below where it fell, three radii across.
+         for (unsigned k = 0; k < wounds.drips && box[2] - box[0] < 1.f; ++k) {
+             const float* d = wounds.d[k];
+@@ -3032,6 +3081,11 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+                 g.uniform4f(u.at[uWoundRect], box[0], box[1], box[2], box[3]);
+                 g.uniform1f(u.at[uDripCount], float(wounds.drips));
+                 if (wounds.drips) g.uniform4fv(u.at[uDripA], GLsizei(wounds.drips), &wounds.d[0][0]);
++                g.uniform1f(u.at[uCapCount], float(wounds.caps));
++                if (wounds.caps) {
++                    g.uniform4fv(u.at[uCapA], GLsizei(wounds.caps), &wounds.capA[0][0]);
++                    g.uniform4fv(u.at[uCapB], GLsizei(wounds.caps), &wounds.capB[0][0]);
++                }
+                 g.uniform4f(u.at[uWorldUp], projection.worldUpX, projection.worldUpY, projection.worldUpZ, 0.f);
+                 // The box as a quad, in the vertex shader's -1..1 position (uv = position * 0.5 + 0.5).
+                 const float quad[8] = {box[0] * 2.f - 1.f, box[1] * 2.f - 1.f, box[2] * 2.f - 1.f, box[1] * 2.f - 1.f,
+diff --git src/mod/wounds_bake.inl src/mod/wounds_bake.inl
+index 8b6cb29..cf2415e 100644
+--- src/mod/wounds_bake.inl
++++ src/mod/wounds_bake.inl
+@@ -540,6 +540,8 @@ static void woundSkinAssign() {
+         if (woundBurns[b].level) claim(woundBurns[b].actor, 0);
+     for (int b = 0; b < woundBurnScarCount; ++b)
+         if (woundBurnScars[b].level) claim(woundBurnScars[b].actor, 0);
++    for (int b = 0; b < woundSeveredCount; ++b)
++        if (woundSevered[b].level) claim(woundSevered[b].actor, 0);
+     for (unsigned k = 0; k < woundSkinLimit; ++k)
+         if (!wanted[k] && woundSkinSlots[k].actor) woundSkinSlots[k] = {}; // its texture is kept for the next one
+ }
+@@ -672,6 +674,199 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+     }
+ }
+ 
++// ---- severed limbs (DISMEMBER-PLAN.md, stage 1) ------------------------------------------------
++
++// The game's part indices (+0x468) each "injuries.severed" bit cuts off, top first; the top part's parent.
++struct WoundCut { int parts[3]; int parent; };
++static constexpr WoundCut woundCuts[8] = {
++    {{1, 2, 3}, 0}, {{2, 3, -1}, 1}, {{4, 5, 6}, 0}, {{5, 6, -1}, 4},          // thighs (at the hip), shins (at the knee)
++    {{11, 12, 16}, 10}, {{12, 16, -1}, 11}, {{14, 15, 17}, 13}, {{15, 17, -1}, 14}, // upper arms (shoulder), forearms (elbow)
++};
++constexpr unsigned woundBandSamples = 96;
++
++// One severed mesh: per face 0 body, 1 limb, 2 the band (left out); per cut, the band ring's bind
++// positions and the bones each side follows. Rebuilt when the mesh or its bits change.
++struct WoundSeverMesh {
++    uintptr_t node = 0, actor = 0;
++    uint32_t bits = 0;
++    std::vector<unsigned char> faces; // by face index (+0x290)
++    struct Ring {
++        int bit = -1, parentBone = -1, topBone = -1, farBone = -1; // far: the hand or foot, to face the end away from
++        unsigned count = 0;
++        float bind[woundBandSamples][3];
++    } rings[8];
++    unsigned ringCount = 0;
++};
++static WoundSeverMesh woundSeverMeshes[4]; // render thread
++
++static int woundBonePart(const WoundSkinMesh& m, int k) {
++    const uintptr_t transform = *(const uintptr_t*)(m.boneNodes + size_t(k) * 8);
++    if (transform < field::sceneNode::transform) return -1;
++    const uintptr_t node = transform - field::sceneNode::transform;
++    const uintptr_t part = *(const uintptr_t*)(node + field::sceneNode::bodyPart);
++    if (!part) return -1;
++    const int index = *(const int*)(part + woundPartIndex);
++    return index >= 0 && index < 18 ? index : -1;
++}
++
++static bool woundSeverBuild(uintptr_t node, uintptr_t actor, uint32_t bits, WoundSeverMesh& out) {
++    WoundSkinMesh m;
++    if (!woundSkinMesh(node, m)) return false;
++    out = {};
++    out.node = node;
++    out.actor = actor;
++    out.bits = bits;
++    bool severedBone[fp::wear::maxBones]{};
++    int boneOfPart[18];
++    for (int& v : boneOfPart) v = -1;
++    for (int k = 0; k < m.bones; ++k) {
++        const int part = woundBonePart(m, k);
++        if (part < 0) continue;
++        if (boneOfPart[part] < 0) boneOfPart[part] = k;
++        for (unsigned bit = 0; bit < 8; ++bit)
++            if (bits & (1u << bit))
++                for (int p : woundCuts[bit].parts)
++                    if (p == part) severedBone[k] = true;
++    }
++    const auto* weights = (const fp::wear::Weights*)m.weights.data;
++    auto share = [&](unsigned p) {
++        float s = 0.f;
++        for (int k = 0; k < 4; ++k)
++            if (weights[p].bone[k] >= 1 && weights[p].bone[k] <= m.bones && severedBone[weights[p].bone[k] - 1] &&
++                weights[p].weight[k] > 0.f)
++                s += weights[p].weight[k];
++        return s;
++    };
++    out.faces.assign(size_t(m.lastFace) + 1, 0);
++    for (unsigned bit = 0; bit < 8; ++bit) {
++        if (!(bits & (1u << bit)) || out.ringCount == 8) continue;
++        auto& ring = out.rings[out.ringCount++];
++        ring.bit = int(bit);
++        ring.topBone = boneOfPart[woundCuts[bit].parts[0]];
++        ring.parentBone = boneOfPart[woundCuts[bit].parent];
++        for (int p : woundCuts[bit].parts)
++            if (p >= 0 && boneOfPart[p] >= 0) ring.farBone = boneOfPart[p];
++    }
++    for (int f = 0; f <= m.lastFace; ++f) {
++        const unsigned* tri = (const unsigned*)(m.triangles + size_t(f) * 12);
++        int limb = 0;
++        unsigned p[3];
++        for (int c = 0; c < 3; ++c) {
++            if (tri[c] > unsigned(m.lastVertex)) return false;
++            p[c] = *(const unsigned*)(m.posIndices + size_t(tri[c]) * 4);
++            if (p[c] >= m.positions.count) return false;
++            limb += share(p[c]) >= 0.5f ? 1 : 0;
++        }
++        out.faces[size_t(f)] = limb == 3 ? 1 : limb == 0 ? 0 : 2;
++        if (limb != 0 && limb != 3) // the band: its corners make the ring (to the nearest cut's sample list)
++            for (unsigned r = 0; r < out.ringCount; ++r) {
++                auto& ring = out.rings[r];
++                for (int c = 0; c < 3 && ring.count < woundBandSamples; ++c)
++                    memcpy(ring.bind[ring.count++], (const float*)(m.source + size_t(p[c]) * 12), 12);
++                break; // one ring per mesh is enough for a single cut; several cuts share the first (stage 1)
++            }
++    }
++    return true;
++}
++
++// The mesh's split for this draw, cached; null when the character has nothing severed.
++static const WoundSeverMesh* woundSeverOf(uintptr_t node, uintptr_t actor) {
++    const uint32_t bits = woundSeveredBits(actor) & 0xFF;
++    if (!bits) return nullptr;
++    for (const WoundSeverMesh& s : woundSeverMeshes)
++        if (s.node == node && s.bits == bits) return &s;
++    static unsigned next = 0;
++    WoundSeverMesh& slot = woundSeverMeshes[next];
++    next = (next + 1) % 4;
++    if (!woundSeverBuild(node, actor, bits, slot)) { slot = {}; return nullptr; }
++    return &slot;
++}
++
++// The caps: each ring carried by the parent bone (the stump) and by the severed bone (the end), as a
++// disc through the ring's centre facing away from the bone's own centre. woundLock held.
++static void woundSeveredCaps(const float* view, WoundUniforms& out) {
++    out.caps = 0;
++    for (const WoundSeverMesh& s : woundSeverMeshes) {
++        if (!s.node || !(woundSeveredBits(s.actor) & s.bits)) continue;
++        __try {
++            WoundSkinMesh m;
++            if (!woundSkinMesh(s.node, m)) continue;
++            float sectorOrigin[3]{};
++            const uintptr_t sector = *(const uintptr_t*)(s.node + field::sceneNode::sector);
++            if (sector && readable(sector, field::sector::origin + 12))
++                memcpy(sectorOrigin, (const void*)(sector + field::sector::origin), sizeof sectorOrigin);
++            for (unsigned r = 0; r < s.ringCount && out.caps + 2 <= 8; ++r) {
++                const auto& ring = s.rings[r];
++                if (ring.count < 3 || ring.parentBone < 0 || ring.topBone < 0) continue;
++                for (int side = 0; side < 2; ++side) {
++                    const int bone = side ? ring.topBone : ring.parentBone;
++                    float now[16], bind[16];
++                    if (!fp::wear::affine((const float*)(*(const uintptr_t*)(m.boneNodes + size_t(bone) * 8)), now) ||
++                        !fp::wear::affine((const float*)(m.inverseBind + size_t(bone) * 48), bind))
++                        break;
++                    float skin[16];
++                    fp::wear::product(bind, now, skin); // bind position -> where this bone carries it now
++                    float centre[3]{}, q[3];
++                    for (unsigned v = 0; v < ring.count; ++v) {
++                        if (!fp::wear::point(skin, ring.bind[v], q)) break;
++                        for (int i = 0; i < 3; ++i) centre[i] += q[i] / float(ring.count);
++                    }
++                    float radius = 0.f;
++                    for (unsigned v = 0; v < ring.count; ++v) {
++                        fp::wear::point(skin, ring.bind[v], q);
++                        radius += std::sqrt((q[0] - centre[0]) * (q[0] - centre[0]) + (q[1] - centre[1]) * (q[1] - centre[1]) +
++                                            (q[2] - centre[2]) * (q[2] - centre[2])) / float(ring.count);
++                    }
++                    // Facing: the ring's own plane (its centre, a first point and the point making the widest
++                    // angle with it), turned away from that side's flesh: the parent bone's origin for the
++                    // stump, the hand's or foot's for the severed end.
++                    float first[3], wide[3]{}, n[3]{};
++                    fp::wear::point(skin, ring.bind[0], q);
++                    for (int i = 0; i < 3; ++i) first[i] = q[i] - centre[i];
++                    float widest = 0.f;
++                    for (unsigned v = 1; v < ring.count; ++v) {
++                        fp::wear::point(skin, ring.bind[v], q);
++                        const float d[3] = {q[0] - centre[0], q[1] - centre[1], q[2] - centre[2]};
++                        const float x[3] = {first[1] * d[2] - first[2] * d[1], first[2] * d[0] - first[0] * d[2],
++                                            first[0] * d[1] - first[1] * d[0]};
++                        const float sq = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
++                        if (sq > widest) { widest = sq; memcpy(wide, x, sizeof wide); }
++                    }
++                    if (!(widest > 1e-6f) || !(radius > 0.5f) || radius > 30.f) break;
++                    const float wl = 1.f / std::sqrt(widest);
++                    for (int i = 0; i < 3; ++i) n[i] = wide[i] * wl;
++                    const int refBone = side ? ring.farBone : ring.parentBone;
++                    float ref[16];
++                    if (refBone < 0 || !fp::wear::affine((const float*)(*(const uintptr_t*)(m.boneNodes + size_t(refBone) * 8)), ref)) break;
++                    if (n[0] * (centre[0] - ref[12]) + n[1] * (centre[1] - ref[13]) + n[2] * (centre[2] - ref[14]) < 0.f)
++                        for (float& v : n) v = -v;
++                    const float* facing = n;
++                    // The nearer reading of the sector origin, as for the marks.
++                    float best[3]{}, bestSq = woundReachCm * woundReachCm;
++                    bool found = false;
++                    for (int candidate = 0; candidate < 2; ++candidate) {
++                        float c[3];
++                        for (int k = 0; k < 3; ++k) q[k] = centre[k] + (candidate ? sectorOrigin[k] : 0.f);
++                        for (int k = 0; k < 3; ++k) c[k] = q[0] * view[k] + q[1] * view[4 + k] + q[2] * view[8 + k] + view[12 + k];
++                        const float sq = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
++                        if (std::isfinite(sq) && sq < bestSq) { bestSq = sq; memcpy(best, c, sizeof c); found = true; }
++                    }
++                    if (!found) break;
++                    float dir[3];
++                    for (int k = 0; k < 3; ++k) dir[k] = facing[0] * view[k] + facing[1] * view[4 + k] + facing[2] * view[8 + k];
++                    const float a[4] = {best[0], best[1], best[2], radius * 1.1f};
++                    const float bb[4] = {dir[0], dir[1], dir[2], float(side)};
++                    memcpy(out.capA[out.caps], a, sizeof a);
++                    memcpy(out.capB[out.caps], bb, sizeof bb);
++                    ++out.caps;
++                }
++            }
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            woundSkinFaults.fetch_add(1, std::memory_order_relaxed);
++        }
++    }
++}
++
+ // ---- 3. draw ----------------------------------------------------------------------------------
+ 
+ static int woundSkinSlotOf(uintptr_t node) {
+@@ -689,10 +884,11 @@ static bool woundSkinSubmission(uintptr_t node) {
+     return woundSkinSlotOf(node) >= 0;
+ }
+ 
+-struct WoundSkinSwap { unsigned slot; GLuint textures[3]; };
++struct WoundSkinSwap { unsigned slot; GLuint textures[3]; bool ready; };
+ static const GLuint* woundSkinReplacement(fp::CueResources& r, const StoneGl&, const void* context) {
+     auto* swap = (WoundSkinSwap*)const_cast<void*>(context);
+     const unsigned k = swap->slot;
++    if (!swap->ready) return swap->textures; // a severed character before its bake: its own maps
+     if (!r.woundSkinTex[k]) return nullptr;
+     swap->textures[0] = r.woundSkinTex[k];
+     if (woundSkinSlots[k].normalReady && r.woundSkinNrm[k]) swap->textures[2] = r.woundSkinNrm[k];
+@@ -739,8 +935,17 @@ static bool woundSkinDrawBody(uintptr_t node, uintptr_t material, bool bind) {
+         faces += body[f];
+     }
+     if (!faces) return false;
+-    if (!woundSkinCurrent(slot, material, originals)) return false;
+-    WoundSkinSwap swap{unsigned(found), {originals[0], originals[1], originals[2]}};
++    const bool ready = woundSkinCurrent(slot, material, originals);
++    // A severed limb: its faces draw with the limb, the band that bridged the joint is left out.
++    const WoundSeverMesh* cut = woundSeverOf(node, slot.actor);
++    if (!ready && !cut) return false;
++    if (cut) {
++        for (unsigned f = 0; f < plan.count; ++f) {
++            const size_t face = size_t(plan.first) + f;
++            if (face < cut->faces.size() && cut->faces[face] == 2) body[f] = 2;
++        }
++    }
++    WoundSkinSwap swap{unsigned(found), {originals[0], originals[1], originals[2]}, ready};
+     return skinFacesEmit(plan, bind, body.data(), originals, 3, woundSkinReplacement, &swap);
+ }
+ 

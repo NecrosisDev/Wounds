@@ -1,0 +1,384 @@
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index 86f33cf..f3ce80c 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -72,12 +72,16 @@ struct Wound {
+     int8_t partIndex = -1; // the struck part's index (+0x468), 0..17
+     uintptr_t actor = 0;   // the character's scene node, once mapped (wounds_bake.inl)
+     float drip = 0.f;      // counts up to the next drop of blood falling from a bleeding cut
++    float scar = 0.f;      // a cut on the living closing into a scar: 0 open .. 1 a scar for good
+     uint8_t kind = 0;
+ };
+ 
+ // What the finishing pass takes: view-space marks, nearest first.
+ constexpr unsigned woundDripLimit = 96, woundDripShown = 24;
+ constexpr float woundDripSeconds = 120.f, woundDripDrySeconds = 30.f;
++// On the living: an open cut closes into a scar over this long (the Regenerate mark's own time while it
++// runs); a bruise fades away over this long.
++constexpr float woundScarSeconds = 300.f, woundBruiseHealSeconds = 900.f;
+ struct WoundUniforms {
+     unsigned count = 0;
+     unsigned drips = 0;      // blood drops on the floor, below
+@@ -99,13 +103,32 @@ static std::atomic<unsigned> woundsTaken{0}, woundsRetired{0}, woundFaults{0}, w
+ static unsigned woundSkinVersion = 1; // woundLock: bumped when a baked (mapped) mark changes or goes
+ // Injuries' "injuries.burn" mark: a burn level (0..255) per character scene node, read each frame; woundLock.
+ struct WoundBurn { uintptr_t actor; uint32_t level; };
+-static WoundBurn woundBurns[64];
+-static int woundBurnCount = 0;
+-static float woundBurnLevel(uintptr_t actor) {
+-    for (int b = 0; b < woundBurnCount; ++b)
+-        if (woundBurns[b].actor == actor) return float(woundBurns[b].level) / 255.f;
++static WoundBurn woundBurns[64], woundBurnScars[64]; // "injuries.burn" and "injuries.burnscar"
++static int woundBurnCount = 0, woundBurnScarCount = 0;
++static float woundLevelOf(const WoundBurn* table, int count, uintptr_t actor) {
++    for (int b = 0; b < count; ++b)
++        if (table[b].actor == actor) return float(table[b].level) / 255.f;
+     return 0.f;
+ }
++static float woundBurnLevel(uintptr_t actor) { return woundLevelOf(woundBurns, woundBurnCount, actor); }
++static float woundBurnScar(uintptr_t actor) { return woundLevelOf(woundBurnScars, woundBurnScarCount, actor); }
++// One mark's levels into its table; a change of 4/255 or more anywhere re-bakes the skins.
++static void woundReadLevels(int (*marks)(const char*, uintptr_t*, uint32_t*, int), const char* name, WoundBurn* table,
++                            int& count) {
++    uintptr_t markNodes[64]{};
++    uint32_t levels[64]{};
++    int found = 0;
++    __try { found = marks(name, markNodes, levels, 64); }
++    __except (EXCEPTION_EXECUTE_HANDLER) { found = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
++    found = std::clamp(found, 0, 64);
++    bool changed = found != count;
++    for (int b = 0; b < found && !changed; ++b)
++        changed = std::abs(woundLevelOf(table, count, markNodes[b]) * 255.f - float(levels[b])) >= 4.f;
++    if (!changed) return;
++    for (int b = 0; b < found; ++b) table[b] = {markNodes[b], (std::min)(levels[b], 255u)};
++    count = found;
++    ++woundSkinVersion;
++}
+ // Drops of blood fallen from bleeding cuts: where they fell from (the cut, sector-local) and its sector's
+ // origin; the wound pass draws each on the first upward surface 20..200 cm below. woundLock.
+ struct WoundDrip { float from[3], sectorOrigin[3], radius; ULONGLONG born; };
+@@ -423,27 +446,11 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         __except (EXCEPTION_EXECUTE_HANDLER) { brokenCount = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
+         brokenCount = std::clamp(brokenCount, 0, int(woundMendLimit));
+     }
+-    {
+-        uintptr_t burnNodes[64]{};
+-        uint32_t burnLevels[64]{};
+-        int found = 0;
+-        if (const WoundMarkNodes marks = woundMarkExport()) {
+-            __try { found = marks("injuries.burn", burnNodes, burnLevels, 64); }
+-            __except (EXCEPTION_EXECUTE_HANDLER) { found = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
+-            found = std::clamp(found, 0, 64);
+-        }
+-        bool changed = found != woundBurnCount;
+-        for (int b = 0; b < found && !changed; ++b) {
+-            const float before = woundBurnLevel(burnNodes[b]) * 255.f;
+-            changed = std::abs(before - float(burnLevels[b])) >= 4.f;
+-        }
+-        if (changed) {
+-            for (int b = 0; b < found; ++b) woundBurns[b] = {burnNodes[b], (std::min)(burnLevels[b], 255u)};
+-            woundBurnCount = found;
+-            ++woundSkinVersion;
+-        }
+-        out.burning = woundBurnCount > 0;
++    if (const WoundMarkNodes marks = woundMarkExport()) {
++        woundReadLevels(marks, "injuries.burn", woundBurns, woundBurnCount);
++        woundReadLevels(marks, "injuries.burnscar", woundBurnScars, woundBurnScarCount);
+     }
++    out.burning = woundBurnCount > 0 || woundBurnScarCount > 0;
+     const float fadeDt = woundFadeTick ? (std::min)(float(now - woundFadeTick) / 1000.f, 0.5f) : 0.f;
+     woundFadeTick = now;
+     for (unsigned i = 0; i < woundLimit; ++i) {
+@@ -473,9 +480,12 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+             continue;
+         }
+         uintptr_t ownerNode = 0;
+-        if (mendCount || brokenCount) {
+-            __try { ownerNode = *(const uintptr_t*)(owner + field::character::sceneNode); }
+-            __except (EXCEPTION_EXECUTE_HANDLER) { ownerNode = 0; }
++        bool alive = true;
++        __try {
++            alive = (*(const unsigned*)(owner + field::character::lifeFlags) & 0x100) == 0;
++            if (mendCount || brokenCount) ownerNode = *(const uintptr_t*)(owner + field::character::sceneNode);
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            ownerNode = 0;
+         }
+         // A bruise over a bone Injuries reports broken is a fracture (and back to a bruise once it heals).
+         if (w.kind == woundCrush) {
+@@ -488,13 +498,20 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+                 if (w.mapped) ++woundSkinVersion;
+             }
+         }
+-        if (mendCount && fadeDt > 0.f) {
+-            for (int k = 0; ownerNode && k < mendCount; ++k) {
+-                if (mendNodes[k] != ownerNode || !mendSeconds[k]) continue;
+-                w.fade -= fadeDt / float(mendSeconds[k]);
+-                break;
++        // Healing on the living: a cut closes into a scar that stays, a bruise fades away (not while its
++        // bone is broken); Regenerate's mark sets its own, faster pace. The dead keep their wounds.
++        if (alive && fadeDt > 0.f) {
++            float mend = 0.f;
++            for (int k = 0; ownerNode && k < mendCount; ++k)
++                if (mendNodes[k] == ownerNode && mendSeconds[k]) mend = float(mendSeconds[k]);
++            if (w.kind == woundCrush) {
++                if (!w.fracture || mend > 0.f) w.fade -= fadeDt / (mend > 0.f ? mend : woundBruiseHealSeconds);
++            } else if (w.scar < 1.f) {
++                const float before = w.scar;
++                w.scar = (std::min)(w.scar + fadeDt / (mend > 0.f ? mend : woundScarSeconds), 1.f);
++                if (w.mapped && std::floor(before * 10.f) != std::floor(w.scar * 10.f)) ++woundSkinVersion;
+             }
+-            if (w.fade <= 0.02f) { // closed
++            if (w.fade <= 0.02f) { // a bruise gone
+                 if (w.mapped) ++woundSkinVersion;
+                 w = {};
+                 woundsMended.fetch_add(1, std::memory_order_relaxed);
+@@ -509,7 +526,8 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+             __except (EXCEPTION_EXECUTE_HANDLER) { bleed = 0.f; }
+             if (!std::isfinite(bleed)) bleed = 0.f;
+             const float age = float(now - w.born) / 1000.f;
+-            const float flow = (std::max)(std::clamp(bleed / woundBleedFull, 0.f, 1.f), age < woundFreshSeconds ? 0.6f : 0.f);
++            const float flow = w.scar > 0.3f ? 0.f // a closing cut has stopped bleeding
++                               : (std::max)(std::clamp(bleed / woundBleedFull, 0.f, 1.f), age < woundFreshSeconds ? 0.6f : 0.f);
+             if (flow > 0.02f) w.run = (std::min)(w.run + fadeDt * (0.4f + 1.6f * flow), 4.f + 14.f * w.severity);
+             if (flow > 0.15f) w.drip += fadeDt * flow * 2.f; // up to two drops a second while it pours
+             w.wet = flow >= w.wet ? flow : (std::max)(w.wet - fadeDt / woundDrySeconds, flow);
+@@ -564,15 +582,18 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         const Wound& w = woundStore[s.index];
+         // Kind in the whole part of b[3]; its fraction carries a cut's wetness or a bruise's age, 0..1.
+         const float age = float(now - w.born) / 1000.f;
+-        const float aux = w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
++        // Kind + 4 for a scarring cut, its fraction then the scar's progress.
++        const bool scarring = w.kind != woundCrush && w.scar > 0.001f;
++        const float aux = scarring ? (std::min)(w.scar, 1.f)
++                        : w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
+         // A closing wound shrinks towards its middle and pales.
+         const float a[4] = {s.centre[0], s.centre[1], s.centre[2], w.halfLength * w.fade * (w.fracture ? woundFractureScale : 1.f)};
+-        const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind) + 0.98f * aux};
++        const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind + (scarring ? 4 : 0)) + 0.98f * aux};
+         // A mark baked into the skin passes its seed negated: the screen pass then leaves its skin part out.
+         const bool baked = w.mapped && woundSkinBaked(w.owner);
+         // A fracture passes its severity above 1.25 (the screen pass reads it as one).
+         const float c[4] = {w.severity * w.fade + (w.fracture ? 1.5f : 0.f), baked ? -(w.seed + 0.001f) : w.seed,
+-                            w.halfWidth * w.fade, w.run * w.fade};
++                            w.halfWidth * w.fade, w.run * w.fade * (1.f - w.scar)};
+         memcpy(out.a[k], a, sizeof a);
+         memcpy(out.b[k], b, sizeof b);
+         memcpy(out.c[k], c, sizeof c);
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 9d88f4d..525ac33 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -1192,7 +1192,8 @@ vec3 woundMarks(vec3 color) {
+         float baked = C.y < 0.0 ? 1.0 : 0.0;
+         float fracture = step(1.25, C.x);
+         float severity = C.x - 1.5 * fracture, seed = abs(C.y);
+-        float kind = floor(B.w + 0.01), aux = clamp((B.w - kind) / 0.98, 0.0, 1.0);
++        float kind = floor(B.w + 0.01), aux = clamp((B.w - kind) / 0.98, 0.0, 1.0), scar = 0.0;
++        if (kind > 4.0) { kind -= 4.0; scar = aux; aux = 0.0; } // a cut closing into a scar
+         if (kind == 2.0) {
+             // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
+             float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
+@@ -1243,6 +1244,10 @@ vec3 woundMarks(vec3 color) {
+         fabric = mix(fabric, fabric * 0.65, fray);
+         fabric = mix(fabric, vec3(0.1, 0.02, 0.02), slit);
+         vec3 plate = mix(vec3(1.0), blood * 1.6, smear * 0.6);
++        // Healing into a scar: a pale, thin line with a faint pink halo.
++        float scarLine = taper * (1.0 - smoothstep(0.25, 0.6, x)), scarHalo = taper * (1.0 - smoothstep(0.6, 2.0, x));
++        cut = mix(cut, mix(mix(vec3(1.0), vec3(1.05, 0.9, 0.88), scarHalo * 0.45), vec3(1.14, 1.02, 0.97), scarLine * 0.85), scar);
++        inside *= 1.0 - scar;
+         cut = mix(cut, vec3(1.0), baked * (1.0 - layer)); // the skin already carries it
+         cut = mix(cut, fabric, cloth);
+         cut = mix(cut, plate, metal);
+diff --git src/mod/wounds_bake.inl src/mod/wounds_bake.inl
+index 42e0890..8b6cb29 100644
+--- src/mod/wounds_bake.inl
++++ src/mod/wounds_bake.inl
+@@ -10,7 +10,9 @@
+ // gloss, B as metal, shading.flb shadesss_f), fresh blood glossy and dried blood dull; a fracture (R.w 1)
+ // draws as a wider, darker bruise and swells more. Stage 4: burns, from Injuries' "injuries.burn" mark
+ // (a level per character), over the whole skin: reddened first, then blistered, then charred black in
+-// patches; a burnt character without cuts gets a slot too.
++// patches; a burnt character without cuts gets a slot too. Stage 5: scars. A healing cut (kind + 4, its
++// fraction the scar's progress) closes into a pale, thin, slightly raised line with a faint pink halo and
++// a little sheen; healed burns (Injuries' "injuries.burnscar") leave mottled, shiny, slightly lumpy tissue.
+ //
+ // 1. Mapping, once per wound: the hit, kept in its body part's frame, is carried into the frame of
+ //    the bone of the character's _SKIN mesh that is that part's scene node; the nearest body face
+@@ -264,6 +266,7 @@ void main() {
+ static const char* const woundSkinFragmentHead = R"glsl(#version 130
+ uniform float burnLevel; // 0..1: the character's burn
+ uniform float burnSeed;
++uniform float burnScar;  // 0..1: scar tissue left by healed burns
+ float markHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }
+ float burnNoise(vec2 p) {
+     vec2 i = floor(p), f = fract(p);
+@@ -272,6 +275,12 @@ float burnNoise(vec2 p) {
+     float c = markHash(i.x + (i.y + 1.0) * 57.0), d = markHash(i.x + 1.0 + (i.y + 1.0) * 57.0);
+     return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+ }
++// Healed-burn scar tissue: x how much of it, y its mottling, at this texel.
++vec2 burnScarAt(vec2 t) {
++    vec2 o = vec2(burnSeed * 13.1, burnSeed * 7.7);
++    float f = 0.55 * burnNoise(t * 18.0 + o) + 0.3 * burnNoise(t * 41.0 + o) + 0.15 * burnNoise(t * 97.0 + o);
++    return vec2(smoothstep(f - 0.15, f + 0.15, burnScar * 1.6), burnNoise(t * 60.0 + o.yx));
++}
+ // x: reddened, y: blistered, z: charred, w: ash speckle, each 0..1 at this texel.
+ vec4 burnAt(vec2 t) {
+     vec2 o = vec2(burnSeed * 13.1, burnSeed * 7.7);
+@@ -294,9 +303,13 @@ out vec4 fragColor;
+ void main() {
+     vec4 base = textureLod(baseTex, texUv, 0.0);
+     vec3 tint = vec3(1.0);
++    if (burnScar > 0.0) {
++        vec2 s = burnScarAt(texUv);
++        tint *= mix(vec3(1.0), mix(vec3(1.1, 0.9, 0.88), vec3(1.2, 1.1, 1.05), s.y), s.x * 0.7);
++    }
+     if (burnLevel > 0.0) {
+         vec4 b = burnAt(texUv);
+-        tint = mix(vec3(1.0), vec3(1.0, 0.62, 0.52), b.x * 0.8);
++        tint *= mix(vec3(1.0), vec3(1.0, 0.62, 0.52), b.x * 0.8);
+         tint = mix(tint, vec3(1.15, 1.02, 0.82), b.y * 0.7);
+         tint = mix(tint, mix(vec3(0.1, 0.07, 0.05), vec3(0.35, 0.33, 0.3), b.w), b.z);
+     }
+@@ -305,7 +318,8 @@ void main() {
+         vec4 P = markP[i], Q = markQ[i], R = markR[i];
+         vec2 o = texUv - P.xy;
+         vec2 q = vec2(dot(P.zw, o), dot(Q.xy, o));
+-        float kind = floor(R.x + 0.01), aux = clamp((R.x - kind) / 0.98, 0.0, 1.0);
++        float kind = floor(R.x + 0.01), aux = clamp((R.x - kind) / 0.98, 0.0, 1.0), scar = 0.0;
++        if (kind > 4.0) { kind -= 4.0; scar = aux; aux = 0.0; }
+         float severity = R.y, seed = R.z, fracture = R.w;
+         if (kind == 2.0) {
+             float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
+@@ -331,6 +345,10 @@ void main() {
+         vec3 cut = mix(vec3(1.0), mix(vec3(0.55, 0.3, 0.24), vec3(0.7, 0.22, 0.2), aux), smear * (0.55 + 0.35 * severity));
+         cut = mix(cut, vec3(1.0, 0.5, 0.45), lip * 0.8);
+         cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
++        // Healing into a scar: the gash closes to a pale, thin line with a faint pink halo.
++        float line = taper * (1.0 - smoothstep(0.25, 0.6, x));
++        float halo = taper * (1.0 - smoothstep(0.6, 2.0, x));
++        cut = mix(cut, mix(mix(vec3(1.0), vec3(1.05, 0.9, 0.88), halo * 0.45), vec3(1.14, 1.02, 0.97), line * 0.85), scar);
+         tint *= cut;
+     }
+     fragColor = vec4(base.rgb * tint, base.a);
+@@ -359,7 +377,8 @@ void main() {
+         vec4 P = markP[i], Q = markQ[i], R = markR[i];
+         vec2 o = texUv - P.xy;
+         vec2 q = vec2(dot(P.zw, o), dot(Q.xy, o));
+-        float kind = floor(R.x + 0.01);
++        float kind = floor(R.x + 0.01), scar = 0.0;
++        if (kind > 4.0) { scar = clamp((R.x - kind) / 0.98, 0.0, 1.0); kind -= 4.0; }
+         float severity = R.y, seed = R.z, near;
+         if (kind == 2.0) {
+             float r = length(q) / Q.z;
+@@ -371,7 +390,8 @@ void main() {
+             float wobble = 0.22 * Q.w * sin(a * 5.0 + seed * 40.0);
+             float x = abs(q.y - wobble) / max(Q.w * (0.25 + 0.75 * taper), 0.05);
+             float lip = taper * smoothstep(0.7, 1.1, x) * (1.0 - smoothstep(1.3, 2.4, x));
+-            h += -0.4 * severity * taper * (1.0 - smoothstep(0.0, 1.0, x)) + 0.12 * severity * lip; // the gash, its lips
++            float line = taper * (1.0 - smoothstep(0.25, 0.6, x));
++            h += mix(-0.4 * severity * taper * (1.0 - smoothstep(0.0, 1.0, x)) + 0.12 * severity * lip, 0.06 * line, scar); // the gash and lips, or the scar's ridge
+             near = max(abs(a), x * 0.25);
+         }
+         if (near < best) {
+@@ -386,6 +406,11 @@ void main() {
+         float hb = 0.12 * b.y - 0.05 * b.z * step(0.6, burnNoise(texUv * 120.0));
+         slope += vec2(dFdx(hb) * texSize.x, dFdy(hb) * texSize.y) / 150.0;
+     }
++    if (burnScar > 0.0) {
++        vec2 s = burnScarAt(texUv);
++        float hs = 0.04 * s.x * (s.y - 0.5); // lumpy scar tissue
++        slope += vec2(dFdx(hs) * texSize.x, dFdy(hs) * texSize.y) / 150.0;
++    }
+     vec2 n = clamp(base.xy * 2.0 - 1.0 - slope, vec2(-0.95), vec2(0.95));
+     fragColor = vec4(n * 0.5 + 0.5, base.z, base.w);
+ }
+@@ -402,11 +427,12 @@ in vec2 texUv;
+ out vec4 fragColor;
+ void main() {
+     vec4 base = textureLod(baseTex, texUv, 0.0);
+-    float blood = 0.0, wet = 0.0;
++    float blood = 0.0, wet = 0.0, sheen = 0.0;
+     for (int i = 0; i < 16; ++i) {
+         if (float(i) >= markCount) break;
+         vec4 P = markP[i], Q = markQ[i], R = markR[i];
+-        float kind = floor(R.x + 0.01), aux = clamp((R.x - kind) / 0.98, 0.0, 1.0);
++        float kind = floor(R.x + 0.01), aux = clamp((R.x - kind) / 0.98, 0.0, 1.0), scar = 0.0;
++        if (kind > 4.0) { kind -= 4.0; scar = aux; aux = 0.0; }
+         if (kind == 2.0) continue; // bruises leave the skin's own sheen
+         vec2 o = texUv - P.xy;
+         vec2 q = vec2(dot(P.zw, o), dot(Q.xy, o));
+@@ -416,11 +442,13 @@ void main() {
+         float x = abs(q.y - wobble) / max(Q.w * (0.25 + 0.75 * taper), 0.05);
+         float inside = taper > 0.0 ? 1.0 - smoothstep(0.6, 1.0, x) : 0.0;
+         float smear = (1.0 - smoothstep(1.2, 4.0, x)) * (1.0 - smoothstep(0.8, 1.25, abs(a)));
+-        float cover = max(inside, 0.6 * smear * R.y);
++        float cover = max(inside, 0.6 * smear * R.y) * (1.0 - scar);
+         if (cover > blood) { blood = cover; wet = aux; }
++        sheen = max(sheen, taper * (1.0 - smoothstep(0.25, 0.6, x)) * scar);
+     }
+     vec3 spec = vec3(mix(0.12, 0.75, wet), mix(0.25, 0.9, wet), 0.0); // strength, gloss, metal
+-    vec3 skin = base.rgb;
++    vec3 skin = mix(base.rgb, vec3(0.3, 0.6, 0.0), sheen * 0.6); // scars: a little sheen
++    if (burnScar > 0.0) skin = mix(skin, vec3(0.35, 0.75, 0.0), burnScarAt(texUv).x * 0.8);
+     if (burnLevel > 0.0) {
+         vec4 b = burnAt(texUv);
+         skin = mix(skin, vec3(0.5, 0.8, 0.0), b.y);   // blisters: wet and glossy
+@@ -510,6 +538,8 @@ static void woundSkinAssign() {
+         if (w.part && w.mapped) claim(w.actor, w.owner);
+     for (int b = 0; b < woundBurnCount; ++b)
+         if (woundBurns[b].level) claim(woundBurns[b].actor, 0);
++    for (int b = 0; b < woundBurnScarCount; ++b)
++        if (woundBurnScars[b].level) claim(woundBurnScars[b].actor, 0);
+     for (unsigned k = 0; k < woundSkinLimit; ++k)
+         if (!wanted[k] && woundSkinSlots[k].actor) woundSkinSlots[k] = {}; // its texture is kept for the next one
+ }
+@@ -545,7 +575,7 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+         for (unsigned k = 0; k < woundSkinLimit && baked < 2; ++k) {
+             WoundSkinSlot& slot = woundSkinSlots[k];
+             if (!slot.actor || !slot.diffuse.source || slot.diffuse.failed) continue;
+-            const float burn = woundBurnLevel(slot.actor);
++            const float burn = woundBurnLevel(slot.actor), burnScar = woundBurnScar(slot.actor);
+             // Marks change (a new one, a mend) or age (bruises darken, mends close): re-bake then, at most every 2 s.
+             const bool changed = slot.bakedVersion != woundSkinVersion;
+             const bool aging = slot.ready && now - slot.bakedAt >= 2000;
+@@ -557,12 +587,15 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 if (!w.part || !w.mapped || !slot.character || w.owner != slot.character || count == woundSkinMarks) continue;
+                 const float det = w.uvAlong[0] * w.uvAcross[1] - w.uvAlong[1] * w.uvAcross[0];
+                 const float age = float(now - w.born) / 1000.f;
+-                const float aux = w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
+-                ages = ages || (w.kind == woundCrush && age < woundBruiseSeconds) || w.fade < 1.f || (w.kind != woundCrush && w.wet > 0.f);
++                const bool scarring = w.kind != woundCrush && w.scar > 0.001f;
++                const float aux = scarring ? (std::min)(w.scar, 1.f)
++                                : w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
++                ages = ages || (w.kind == woundCrush && age < woundBruiseSeconds) || w.fade < 1.f ||
++                       (w.kind != woundCrush && w.wet > 0.f) || (scarring && w.scar < 1.f);
+                 const float length = w.halfLength * w.fade * (w.fracture ? woundFractureScale : 1.f), width = w.halfWidth * w.fade;
+                 const float p[4] = {w.uv[0], w.uv[1], w.uvAcross[1] / det, -w.uvAcross[0] / det};
+                 const float q[4] = {-w.uvAlong[1] / det, w.uvAlong[0] / det, length, width};
+-                const float m[4] = {float(w.kind) + 0.98f * aux, w.severity * w.fade, w.seed, w.fracture ? 1.f : 0.f};
++                const float m[4] = {float(w.kind + (scarring ? 4 : 0)) + 0.98f * aux, w.severity * w.fade, w.seed, w.fracture ? 1.f : 0.f};
+                 memcpy(P[count], p, sizeof p);
+                 memcpy(Q[count], q, sizeof q);
+                 memcpy(R[count], m, sizeof m);
+@@ -579,10 +612,10 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 for (int v = 0; v < 6; ++v) memcpy(corners[count * 6 + v], c[order[v]], 8);
+                 ++count;
+             }
+-            if (!count && burn <= 0.f) continue;
++            if (!count && burn <= 0.f && burnScar <= 0.f) continue;
+             // A burn covers the whole skin: one more quad over all of UV space.
+             unsigned vertices = count * 6;
+-            if (burn > 0.f) {
++            if (burn > 0.f || burnScar > 0.f) {
+                 const float all[6][2] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {0.f, 1.f}, {1.f, 0.f}, {1.f, 1.f}};
+                 memcpy(corners[vertices], all, sizeof all);
+                 vertices += 6;
+@@ -611,6 +644,7 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 g.uniform1f(g.getUniformLocation(program, "markCount"), float(count));
+                 g.uniform2f(g.getUniformLocation(program, "texSize"), float(map.width), float(map.height));
+                 g.uniform1f(g.getUniformLocation(program, "burnLevel"), burn);
++                g.uniform1f(g.getUniformLocation(program, "burnScar"), burnScar);
+                 g.uniform1f(g.getUniformLocation(program, "burnSeed"), float(slot.actor % 997) / 997.f);
+                 g.uniform4fv(g.getUniformLocation(program, "markP"), GLsizei(count), &P[0][0]);
+                 g.uniform4fv(g.getUniformLocation(program, "markQ"), GLsizei(count), &Q[0][0]);

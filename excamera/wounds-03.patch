@@ -1,0 +1,69 @@
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index c0181d1..4b341c2 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -8,7 +8,8 @@
+ 
+ static std::atomic<float> woundMarks{1.f}; // the Wounds row: 0 off
+ 
+-// The runtime's record, shared with ScriptRuntime's character_hits (version 1).
++// The runtime's record, shared with ScriptRuntime's character_hits: version 2 (0x78 bytes); a version 1
++// runtime writes the first 0x70 bytes only (no weapon, kind 0 or 3).
+ struct CharacterHitRecord {
+     uint32_t size, serial;
+     uint64_t victim, part; // the struck character and its struck body part (a rigid body)
+@@ -18,8 +19,11 @@ struct CharacterHitRecord {
+     float health, balance; // what the damage applier received
+     uint32_t kind;         // 0 unknown, 1 cut, 2 crush, 3 thrust
+     uint32_t reserved;
++    uint64_t weapon;       // version 2: the delivering weapon's rigid body; 0 from version 1
+ };
+-static_assert(sizeof(CharacterHitRecord) == 0x70, "character_hits record layout");
++static_assert(sizeof(CharacterHitRecord) == 0x78, "character_hits record layout");
++constexpr uint32_t characterHitsV1Size = 0x70;
++static std::atomic<uint32_t> characterHitsVersion{0}; // 1 or 2 once the export is found
+ using CharacterHits = int (*)(uint32_t after, CharacterHitRecord* out, int capacity);
+ using CharacterHitsVersion = uint32_t (*)();
+ 
+@@ -90,7 +94,9 @@ static CharacterHits characterHitsExport() {
+     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"ScriptRuntime.dll", &runtime) || !runtime) return nullptr;
+     const auto version = reinterpret_cast<CharacterHitsVersion>(GetProcAddress(runtime, "character_hits_version"));
+     const auto fn = reinterpret_cast<CharacterHits>(GetProcAddress(runtime, "character_hits"));
+-    if (!version || !fn || version() != 1) return nullptr;
++    const uint32_t found = version ? version() : 0;
++    if (!fn || (found != 1 && found != 2)) return nullptr;
++    characterHitsVersion.store(found, std::memory_order_relaxed);
+     characterHits.store(fn, std::memory_order_release);
+     return fn;
+ }
+@@ -299,19 +305,24 @@ static void weaponBloodFor(uintptr_t node, float (*out)[4]) {
+ static void takeHits() {
+     const CharacterHits fn = characterHitsExport();
+     if (!fn) return;
+-    CharacterHitRecord hits[16];
++    // Version 1 records are 0x70 bytes apart; they are read into raw space and widened.
++    const bool v1 = characterHitsVersion.load(std::memory_order_relaxed) == 1;
++    const uint32_t stride = v1 ? characterHitsV1Size : uint32_t(sizeof(CharacterHitRecord));
++    alignas(8) unsigned char raw[16 * sizeof(CharacterHitRecord)];
+     for (int round = 0; round < 4; ++round) { // at most 64 new hits a frame
+         int count = 0;
+-        __try { count = fn(woundSerial, hits, 16); }
++        __try { count = fn(woundSerial, reinterpret_cast<CharacterHitRecord*>(raw), 16); }
+         __except (EXCEPTION_EXECUTE_HANDLER) {
+             woundFaults.fetch_add(1, std::memory_order_relaxed);
+             return;
+         }
+         for (int k = 0; k < (std::min)(count, 16); ++k) {
+-            if (hits[k].size != sizeof(CharacterHitRecord)) return;
+-            woundSerial = hits[k].serial; // oldest first
+-            addWound(hits[k]);
+-            addWeaponBlood(hits[k]);
++            CharacterHitRecord hit{};
++            memcpy(&hit, raw + size_t(k) * stride, stride);
++            if (hit.size != stride) return;
++            woundSerial = hit.serial; // oldest first
++            addWound(hit);
++            addWeaponBlood(hit);
+         }
+         if (count < 16) return;
+     }

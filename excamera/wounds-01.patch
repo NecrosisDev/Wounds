@@ -1,0 +1,569 @@
+diff --git src/first_person.cpp src/first_person.cpp
+index 2f647bf..c0070c8 100644
+--- src/first_person.cpp
++++ src/first_person.cpp
+@@ -106,6 +106,7 @@ static MH_STATUS disableStereoHooks() { return MH_OK; }
+ #include "mod/view.inl"
+ #include "mod/supersampling.inl"
+ #include "mod/overlay.inl"
++#include "mod/wounds.inl"
+ #include "mod/view_effects.inl"
+ #include "mod/frame.inl"
+ #include "mod/headwear_render.inl"
+diff --git src/mod/overlay.inl src/mod/overlay.inl
+index 8fc5470..6fb0741 100644
+--- src/mod/overlay.inl
++++ src/mod/overlay.inl
+@@ -34,6 +34,7 @@ using Uniform1i = void(APIENTRY*)(GLint, GLint);
+ using Uniform1f = void(APIENTRY*)(GLint, GLfloat);
+ using Uniform2f = void(APIENTRY*)(GLint, GLfloat, GLfloat);
+ using UniformMatrix4fv = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
++using Uniform4fv = void(APIENTRY*)(GLint, GLsizei, const GLfloat*);
+ using ActiveTexture = void(APIENTRY*)(GLenum);
+ using GenTextures = void(APIENTRY*)(GLsizei, GLuint*);
+ using DeleteTextures = void(APIENTRY*)(GLsizei, const GLuint*);
+@@ -106,6 +107,7 @@ struct Api {
+     Uniform1f uniform1f;
+     Uniform2f uniform2f;
+     UniformMatrix4fv uniformMatrix4fv = nullptr;
++    Uniform4fv uniform4fv = nullptr; // view effects' wound arrays; null leaves the wounds undrawn
+     ActiveTexture activeTexture;
+     GenTextures genTextures;
+     DeleteTextures deleteTextures;
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 180ae2e..a666696 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -503,6 +503,105 @@ uniform mat4 heldFrame1;
+ uniform mat4 heldFrame2;
+ uniform sampler3D heldNoise; // tiling smooth noise, 16 units a tile (held-item surfaces)
+ uniform vec4 worldUp;      // world +Y in view space; w unused
++uniform vec4 woundA[12];   // a wound's view-space centre; w: half length, cm (a bruise's radius)
++uniform vec4 woundB[12];   // the blade's path, view space; w: 1 cut, 2 crush, 3 thrust
++uniform vec4 woundC[12];   // severity 0..1, seed, half width (cm), length of the blood runs (cm)
++uniform float woundCount;
++
++float woundHash(float x) {
++    return fract(sin(x * 12.9898) * 43758.5453);
++}
++
++// Wounds (wounds.inl) on the surface where they landed. They multiply the light already there, so a
++// wound in shadow stays in shadow; only wet blood adds a little shine, scaled by that same light.
++vec3 woundMarks(vec3 color) {
++    float raw = texture2D(depthTex, uv).r;
++    if (raw >= skyDepth) return color;
++    vec3 p = viewPosition(uv, raw);
++    vec3 n = vec3(0.0, 0.0, 1.0);
++    bool near = false;
++    vec3 tint = vec3(1.0);
++    float wet = 0.0;
++    for (int i = 0; i < 12; ++i) {
++        if (float(i) >= woundCount) break;
++        vec4 A = woundA[i], B = woundB[i], C = woundC[i];
++        vec3 d = p - A.xyz;
++        float reach = A.w + C.w + 6.0;
++        if (dot(d, d) > reach * reach) continue;
++        if (!near) {
++            n = viewNormal(uv, p);
++            near = true;
++        }
++        // Only the surface at the wound: something a few cm off it (another limb, a wall behind) is left alone.
++        float stick = 1.0 - smoothstep(2.0, 4.5, abs(dot(d, n)));
++        if (stick <= 0.0) continue;
++        vec3 t = B.xyz - n * dot(B.xyz, n);
++        if (dot(t, t) < 1e-4) t = cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
++        t = normalize(t);
++        vec3 s = cross(n, t);
++        vec2 q = vec2(dot(d, t), dot(d, s)); // cm along the blade's path and across it, on the surface
++        float severity = C.x, seed = C.y;
++        if (B.w > 1.5 && B.w < 2.5) {
++            // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
++            float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
++            float r = length(q) / (A.w * mottle);
++            float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick;
++            vec3 bruise = mix(vec3(0.62, 0.45, 0.62), vec3(0.42, 0.17, 0.2), 1.0 - smoothstep(0.0, 0.7, r));
++            float graze = severity > 0.6 ? step(0.8, woundHash(floor(q.x * 2.0) + floor(q.y * 2.0) * 57.0 + seed * 101.0)) *
++                                               (1.0 - smoothstep(0.0, 0.45, r)) : 0.0;
++            tint *= mix(vec3(1.0), mix(bruise, vec3(0.35, 0.05, 0.04), graze), w);
++            continue;
++        }
++        // A cut, or a thrust's short deep hole: a lens-shaped gash darkest at its depth, swollen lips,
++        // blood smeared around it, and fresh blood running down from it.
++        float a = q.x / A.w;
++        float taper = sqrt(max(1.0 - a * a, 0.0));
++        float wobble = 0.22 * C.z * sin(a * 5.0 + seed * 40.0);
++        float x = abs(q.y - wobble) / max(C.z * (0.25 + 0.75 * taper), 0.05);
++        float inside = taper > 0.0 ? 1.0 - smoothstep(0.6, 1.0, x) : 0.0;
++        float lip = taper * smoothstep(0.7, 1.1, x) * (1.0 - smoothstep(1.3, 2.4, x));
++        float smear = (1.0 - smoothstep(1.2, 4.0, x)) * (1.0 - smoothstep(0.8, 1.25, abs(a))) *
++                      (0.6 + 0.4 * woundHash(floor(q.x * 1.5 + seed * 13.0) + floor(q.y * 1.5) * 31.0));
++        float facing = dot(worldUp.xyz, s) * sign(q.y - wobble); // the lip facing up catches the light
++        vec3 cut = mix(vec3(1.0), vec3(0.7, 0.22, 0.2), smear * (0.55 + 0.35 * severity));
++        cut = mix(cut, vec3(1.0, 0.5, 0.45) * (1.0 + 0.3 * facing), lip * 0.8);
++        cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
++        float run = 0.0;
++        vec3 down = n * dot(worldUp.xyz, n) - worldUp.xyz; // straight down, along the surface
++        if (C.w > 0.0 && dot(down, down) > 0.04) {
++            down = normalize(down);
++            vec3 side = cross(n, down);
++            float below = dot(d, down), across = dot(d, side);
++            float ts = dot(t, side), td = dot(t, down);
++            float thick = 0.2 + 0.25 * severity;
++            for (int k = 0; k < 3; ++k) {
++                float fk = float(k);
++                float at = (woundHash(seed * 7.0 + fk) * 2.0 - 1.0) * (abs(ts) * A.w * 0.8 + C.z);
++                // Each run leaves the cut where the cut crosses its line; a cut running downhill bleeds from its low end.
++                float start = abs(ts) > 0.2 ? clamp(at / ts, -A.w, A.w) * td : A.w * abs(td);
++                if (abs(ts) <= 0.2) at = 0.4 * (fk - 1.0) * C.z;
++                float len = C.w * (0.45 + 0.55 * woundHash(seed * 3.0 + fk + 5.0));
++                float along = below - start;
++                float bead = 1.0 + 0.8 * smoothstep(len * 0.7, len, along);
++                float line = 1.0 - smoothstep(thick * bead * 0.5, thick * bead, abs(across - at - 0.3 * sin(below * 0.4 + fk)));
++                run = max(run, line * step(0.0, along) * (1.0 - smoothstep(len * 0.85, len, along)));
++            }
++            cut = mix(cut, vec3(0.32, 0.02, 0.018), run * 0.9);
++        }
++        tint *= mix(vec3(1.0), cut, stick);
++        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick;
++    }
++    if (!near) return color;
++    vec3 lit = toLight(color);
++    float level = dot(lit, vec3(0.2126, 0.7152, 0.0722));
++    lit *= tint;
++    if (wet > 0.0) {
++        vec3 lightDir = normalize(worldUp.xyz * 0.8 + vec3(0.0, 0.0, 0.6));
++        float spec = pow(max(dot(n, normalize(lightDir + normalize(-p))), 0.0), 24.0);
++        lit += vec3(0.9, 0.55, 0.5) * spec * min(wet, 1.0) * level * (0.4 + 2.5 * level);
++    }
++    return toStored(clamp(lit, 0.0, 1.0));
++}
+ 
+ float lumaAt(vec2 p) {
+     return dot(texture2D(sceneTex, p).rgb, vec3(0.299, 0.587, 0.114));
+@@ -772,6 +871,7 @@ vec3 heldSurface(vec3 color, mat4 frame, vec4 select, float code, float strength
+ void main() {
+     vec4 c = texture2D(sceneTex, uv);
+     vec3 color = smoothEdges > 0.0 ? mix(c.rgb, smoothed(c.rgb), smoothEdges) : sharpen > 0.0 ? sharpened(c.rgb) : c.rgb;
++    if (woundCount > 0.0) color = woundMarks(color); // on the surface itself, before any blur
+     // Occlusion and reflections are low-frequency: applied after the edge passes they look
+     // the same as before them, and this pass then needs no neighbouring shaded pixels.
+     // Sharpened or smoothed first, then blurred where out of focus: blurred areas need neither.
+@@ -864,14 +964,16 @@ enum ViewUniform : unsigned {
+     uStrength, uTaps, uWorldUp, uFocus, uMaxBlur, uLens, uSmoothEdges, uVisor, uGhostA, uGhostB, uCondition,
+     uAoHalf, uSsrHalf, uHalfSize, uAoStrength, uSsrOn, uBounceOn, uBounceStrength, uSharpen, uPreviousDepth, uSurfacesOn, uSsrSize, uDofOn, uDistanceHalf, uDistanceHalfOn,
+     uFrameOffset, uCurrent, uHistory, uToPrevious, uPreviousProjection, uHistoryWeight, uDofHalf, uCells, uExposure,
+-    uSilhouette, uSilhouetteOn, uHeldDetail, uHeldFrame0, uHeldFrame1, uHeldFrame2, uHeldNoise, viewUniformCount
++    uSilhouette, uSilhouetteOn, uHeldDetail, uHeldFrame0, uHeldFrame1, uHeldFrame2, uHeldNoise,
++    uWoundA, uWoundB, uWoundC, uWoundCount, viewUniformCount
+ };
+ static const char* const viewUniformNames[viewUniformCount] = {
+     "sceneTex", "depthTex", "texel", "projection", "depthLinear", "pixelScale", "encoded",
+     "strength", "taps", "worldUp", "focus", "maxBlur", "lens", "smoothEdges", "visor", "ghostA", "ghostB", "condition",
+     "aoHalf", "ssrHalf", "halfSize", "aoStrength", "ssrOn", "bounceOn", "bounceStrength", "sharpen", "previousDepth", "surfacesOn", "ssrSize", "dofOn", "distanceHalf", "distanceHalfOn",
+     "frameOffset", "current", "history", "toPrevious", "previousProjection", "historyWeight", "dofHalf", "cells", "exposure",
+-    "silhouette", "silhouetteOn", "heldDetail", "heldFrame0", "heldFrame1", "heldFrame2", "heldNoise"};
++    "silhouette", "silhouetteOn", "heldDetail", "heldFrame0", "heldFrame1", "heldFrame2", "heldNoise",
++    "woundA", "woundB", "woundC", "woundCount"};
+ struct ViewProgramUniforms { GLint at[viewUniformCount]; };
+ enum ViewProgram : unsigned {
+     programAo, programSsr, programDof, programFinish, programComposite, programResolve, programDofComposite,
+@@ -933,6 +1035,7 @@ static bool loadViewEffectsApi(gl::Api& g) {
+         !loadGl(g.getQueryObjectui64v, "glGetQueryObjectui64v"))
+         g.queryCounter = nullptr; // timings stay off; nothing else depends on them
+     if (!loadGl(g.getAttachmentParameter, "glGetFramebufferAttachmentParameteriv")) g.getAttachmentParameter = nullptr;
++    if (!loadGl(g.uniform4fv, "glUniform4fv")) g.uniform4fv = nullptr; // the wounds stay undrawn
+     // OpenGL 1.1 exports on Windows; wglGetProcAddress is not their loader on every ICD.
+     g.genTextures = glGenTextures;
+     g.deleteTextures = glDeleteTextures;
+@@ -1554,8 +1657,10 @@ struct ViewRequest {
+     float detail = 0.f;                  // held-item detail strength; only with a mask slot below
+     unsigned heldSlots = 0;              // bit k: mask channel k holds held item k this frame
+     HeldPose held[heldSlotLimit]{};
++    WoundUniforms wounds;                // wounds in view, already in this view's space
+     bool finish() const {
+-        return smooth > 0.f || sharpen > 0.f || visor > 0.f || ghost || detail > 0.f || hurt > 0.f || winded > 0.f;
++        return smooth > 0.f || sharpen > 0.f || visor > 0.f || ghost || detail > 0.f || hurt > 0.f || winded > 0.f ||
++               wounds.count;
+     }
+     bool any() const { return ao > 0.f || dof > 0.f || ssr > 0.f || adapt || finish(); }
+ };
+@@ -2327,6 +2432,14 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+                                  projection.worldUpValid ? projection.worldUpZ : 0.f};
+             g.uniform4f(u.at[uWorldUp], up[0], up[1], up[2], 0.f);
+             if (held) heldDetailFrames.fetch_add(1, std::memory_order_relaxed);
++            const WoundUniforms& wounds = request.wounds;
++            const bool woundsOn = wounds.count && g.uniform4fv && projection.worldUpValid;
++            g.uniform1f(u.at[uWoundCount], woundsOn ? float(wounds.count) : 0.f);
++            if (woundsOn) {
++                g.uniform4fv(u.at[uWoundA], GLsizei(wounds.count), &wounds.a[0][0]);
++                g.uniform4fv(u.at[uWoundB], GLsizei(wounds.count), &wounds.b[0][0]);
++                g.uniform4fv(u.at[uWoundC], GLsizei(wounds.count), &wounds.c[0][0]);
++            }
+             g.uniform1f(u.at[uExposure], exposure);
+             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+         }
+@@ -2935,6 +3048,11 @@ static void presentViewEffects(uintptr_t view, const ViewRequest* eye = nullptr)
+         request.detail = heldDetail.load(std::memory_order_relaxed);
+         memcpy(request.held, heldMaskPoses, sizeof request.held);
+     }
++    // Wounds: desktop and VR eyes alike, in the space of the matrices this view was drawn with.
++    if (woundMarks.load(std::memory_order_relaxed) > 0.f) {
++        ViewEffectProjectionSnapshot matrices;
++        if (readViewMatrices(view, matrices)) woundViewUniforms(matrices.view, request.wounds);
++    }
+     request.conditionStrength = conditionEffects.load(std::memory_order_relaxed);
+     if (request.conditionStrength > 0.f) {
+         readCondition(request);
+diff --git src/mod/session.inl src/mod/session.inl
+index 2a2f6a8..f38a192 100644
+--- src/mod/session.inl
++++ src/mod/session.inl
+@@ -616,6 +616,10 @@ static void writeRunningStatus(FILE* f, const Aim& a) {
+     j.unum("silhouette_faults", silhouetteFaults.load());
+     j.unum("held_detail_frames", heldDetailFrames.load());
+     j.unum("held_detail_unanchored", heldDetailUnanchored.load());
++    j.unum("wounds_taken", woundsTaken.load());
++    j.unum("wounds_retired", woundsRetired.load());
++    j.unum("wound_faults", woundFaults.load());
++    j.boolean("wound_hits_linked", characterHits.load() != nullptr);
+     j.unum("held_texture_reads", heldTextureReads.load());
+     j.unum("view_effects_draws", viewEffectsDraws.load());
+     j.unum("view_effects_unavailable", viewEffectsUnavailable.load());
+diff --git src/settings_model.h src/settings_model.h
+index d124f75..d176c78 100644
+--- src/settings_model.h
++++ src/settings_model.h
+@@ -110,6 +110,7 @@ enum : int {
+     fingerPosesOthers,
+     conditionEffects,
+     heldDetail,
++    woundMarks,
+     count
+ };
+ }
+@@ -145,6 +146,7 @@ struct ModSettings {
+     int bladeGainPercent = 100; // the gain on the draw velocity handed to the game's impact, 10..400
+     bool conditionEffects = false; // optional: the view reacts to wounds and breathlessness
+     int heldDetail = 50; // procedural surface detail on held items, percent; half (the old Subtle) by default (owner's request)
++    bool woundMarks = true; // cuts, bruises and running blood where weapons got through; on by default (owner's request)
+     bool tracking = false;
+     int trackingKey = 0;
+     int trackingStatus = 0; // runtime only: off/waiting/receiving/unavailable
+@@ -412,7 +414,8 @@ struct ModSettings {
+               setting::vrPanelDistance, setting::vrComfort, setting::vrBody, setting::vrHeight, setting::vrGrabTurn, setting::vrEyeScale, setting::vrGripSlide, setting::vrKick, setting::vrFingerBones, setting::tracking, setting::trackingKey}, 21},
+             {"Graphics",
+              {setting::ambientOcclusion, setting::screenSpaceReflections, setting::depthOfField, setting::heldDetail,
+-              setting::edgeSmoothing, setting::conditionEffects, setting::fingerPoses, setting::playerGhost}, 8},
++              setting::woundMarks, setting::edgeSmoothing, setting::conditionEffects, setting::fingerPoses,
++              setting::playerGhost}, 9},
+         };
+         return groups[g < 0 || g >= groupCount ? 0 : g];
+     }
+@@ -1122,6 +1125,11 @@ inline const RowInfo& rowInfo(int row) {
+          L"Below half health the view loses colour and darkens at the edges; when out of breath the edges darken "
+          L"with each breath, and the eyes take a moment to adjust between light and darkness. Uses the game's own "
+          L"health and stamina."},
++        {setting::woundMarks, L"Wounds", RowInfo::toggle, nullptr, &ModSettings::woundMarks,
++         L"View", L"Wounds", nullptr, nullptr,
++         L"Where a weapon gets through, the character keeps the mark and it moves with the limb: a gash along the "
++         L"blade's path for a cut, a deep hole for a thrust, a bruise for a blunt blow, with blood running down "
++         L"from fresh cuts. Blows the armour stops leave nothing. Needs the Lua script runtime."},
+     };
+     static const RowInfo none{-1,      L"",     RowInfo::toggle, nullptr, nullptr,
+                               nullptr, nullptr, nullptr,         nullptr, nullptr};
+diff --git src/settings_presentation.cpp src/settings_presentation.cpp
+index 01d39c3..23defa4 100644
+--- src/settings_presentation.cpp
++++ src/settings_presentation.cpp
+@@ -91,6 +91,7 @@ const wchar_t* settingLabel(int id) {
+     case setting::bladeGain: return L"Blade draw gain";
+     case setting::conditionEffects: return L"Hurt and winded";
+     case setting::heldDetail: return L"Held item detail";
++    case setting::woundMarks: return L"Wounds";
+     case setting::crouchMode: return L"Crouch";
+     case setting::rmbMode: return L"RMB cursor";
+     case setting::rotateHeldKey: return L"Rotate item";
+diff --git src/mod/settings.inl src/mod/settings.inl
+index e51426c..408b6b7 100644
+--- src/mod/settings.inl
++++ src/mod/settings.inl
+@@ -33,6 +33,7 @@ static panel::ModSettings readLiveSettings() { // caller holds settingsLock
+     s.fingerPosesOthers = fingerPosesOthers.load() != 0;
+     s.conditionEffects = conditionEffects.load() > 0.f;
+     s.heldDetail = int(std::lround(heldDetail.load() * 100.f));
++    s.woundMarks = woundMarks.load() > 0.f;
+     s.headSteady = headSteady.load();
+     s.rawMouse = rawMouse;
+     s.rawMouseFallback = rawMouse && !rawWanted.load();
+@@ -150,6 +151,7 @@ static void writeLiveSettings(const panel::ModSettings& requested) {
+     fingerPosesOthers = s.fingerPosesOthers ? 1 : 0;
+     conditionEffects = s.conditionEffects ? 0.5f : 0.f;
+     heldDetail = effectStrength(s.heldDetail);
++    woundMarks = s.woundMarks ? 1.f : 0.f;
+     headSteady = s.headSteady;
+     if (rawMouse != s.rawMouse) rawWanted = s.rawMouse;
+     rawMouse = s.rawMouse;
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+new file mode 100644
+index 0000000..246e145
+--- /dev/null
++++ src/mod/wounds.inl
+@@ -0,0 +1,258 @@
++// Wounds: where a weapon got through, the struck character keeps a mark that moves with the limb: a
++// gash along the blade's path for a cut, a short deep hole for a thrust, a bruise for a crush, and
++// blood running down from fresh cuts. The hits come from ScriptRuntime.dll's character_hits export
++// (version 1), which records them inside the game's damage applier; ExCamera only reads them. Each
++// mark is kept in its body part's own frame and the finishing pass (view_effects.inl) draws it on
++// the surface at that spot, so a blow the armour stopped leaves nothing (it dealt no damage) and a
++// cut through cloth shows on the cloth. No native memory is written.
++
++static std::atomic<float> woundMarks{1.f}; // the Wounds row: 0 off
++
++// The runtime's record, shared with ScriptRuntime's character_hits (version 1).
++struct CharacterHitRecord {
++    uint32_t size, serial;
++    uint64_t victim, part; // the struck character and its struck body part (a rigid body)
++    float point[3];        // contact point, in the space of the part's pose
++    float direction[3];    // the weapon's motion at contact, same space; zero when unknown
++    float pose[12];        // the part's achieved pose at the hit: three axes then the origin
++    float health, balance; // what the damage applier received
++    uint32_t kind;         // 0 unknown, 1 cut, 2 crush, 3 thrust
++    uint32_t reserved;
++};
++static_assert(sizeof(CharacterHitRecord) == 0x70, "character_hits record layout");
++using CharacterHits = int (*)(uint32_t after, CharacterHitRecord* out, int capacity);
++using CharacterHitsVersion = uint32_t (*)();
++
++constexpr unsigned woundLimit = 96, woundsPerPart = 4;
++constexpr unsigned woundShownLimit = 12; // the finishing program's arrays
++constexpr float woundReachCm = 3000.f, woundMergeCm = 2.5f;
++enum WoundKind : uint8_t { woundCut = 1, woundCrush = 2, woundThrust = 3 };
++// A struck body part's character, where the game's weapon impact (0x159A60) reads its victim; that impact
++// hands the same pointer to the damage applier, so it equals the record's victim.
++constexpr size_t woundPartCharacter = 0x420;
++
++struct Wound {
++    uintptr_t part = 0, owner = 0; // the part, and the character it named at the hit; a change retires the mark
++    float local[3]{}, along[3]{};  // centre and the blade's path, in the part's own frame
++    float halfLength = 0.f, halfWidth = 0.f, severity = 0.f, seed = 0.f;
++    ULONGLONG born = 0;
++    uint8_t kind = 0;
++};
++
++// What the finishing pass takes: view-space marks, nearest first.
++struct WoundUniforms {
++    unsigned count = 0;
++    float a[woundShownLimit][4]; // centre; w: half length, cm (a bruise's radius)
++    float b[woundShownLimit][4]; // the blade's path, unit; w: kind
++    float c[woundShownLimit][4]; // severity 0..1, seed, half width (cm), blood run length (cm)
++};
++
++static Wound woundStore[woundLimit];
++static unsigned woundNext = 0;
++static uint32_t woundSerial = 0; // the newest record taken
++static SRWLOCK woundLock = SRWLOCK_INIT;
++static std::atomic<CharacterHits> characterHits{nullptr};
++static std::atomic<ULONGLONG> characterHitsProbed{0};
++static std::atomic<unsigned> woundsTaken{0}, woundsRetired{0}, woundFaults{0};
++
++// The runtime's export, looked up again at most every two seconds until found; the module is pinned
++// once found, so the cached entry stays valid for the life of the process.
++static CharacterHits characterHitsExport() {
++    if (auto fn = characterHits.load(std::memory_order_acquire)) return fn;
++    const ULONGLONG now = GetTickCount64();
++    if (now - characterHitsProbed.load(std::memory_order_relaxed) < 2000) return nullptr;
++    characterHitsProbed.store(now, std::memory_order_relaxed);
++    HMODULE runtime = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"ScriptRuntime.dll", &runtime) || !runtime) return nullptr;
++    const auto version = reinterpret_cast<CharacterHitsVersion>(GetProcAddress(runtime, "character_hits_version"));
++    const auto fn = reinterpret_cast<CharacterHits>(GetProcAddress(runtime, "character_hits"));
++    if (!version || !fn || version() != 1) return nullptr;
++    characterHits.store(fn, std::memory_order_release);
++    return fn;
++}
++
++// A world point (or, with origin false, a direction) into the pose's own frame; false for a degenerate pose.
++static bool intoPose(const float* pose, const float* v, bool origin, float* out) {
++    float d[3];
++    for (int i = 0; i < 3; ++i) d[i] = v[i] - (origin ? pose[9 + i] : 0.f);
++    for (int a = 0; a < 3; ++a) {
++        const float* axis = pose + a * 3;
++        const float lengthSq = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
++        if (!std::isfinite(lengthSq) || lengthSq < 1e-8f) return false;
++        out[a] = (d[0] * axis[0] + d[1] * axis[1] + d[2] * axis[2]) / lengthSq;
++    }
++    return std::isfinite(out[0] + out[1] + out[2]);
++}
++
++static void outOfPose(const float* pose, const float* local, bool origin, float* out) {
++    for (int i = 0; i < 3; ++i)
++        out[i] = (origin ? pose[9 + i] : 0.f) + local[0] * pose[i] + local[1] * pose[3 + i] + local[2] * pose[6 + i];
++}
++
++static void addWound(const CharacterHitRecord& h) {
++    const float health = std::isfinite(h.health) ? h.health : 0.f;
++    const float balance = std::isfinite(h.balance) ? h.balance : 0.f;
++    // PROVISIONAL(2026-10-22, until the runtime reports the weapon's cut/crush split a cut is told
++    // from a blow by moving more health per balance, ratify-by: 2026-11-05)
++    const uint8_t kind = h.kind >= woundCut && h.kind <= woundThrust ? uint8_t(h.kind)
++                         : health > 0.4f * balance                  ? woundCut
++                                                                    : woundCrush;
++    if (kind == woundCrush ? balance < 0.05f && health < 1e-3f : health < 1e-3f) return; // nothing got through
++    Wound w;
++    w.part = uintptr_t(h.part);
++    float healthMax = 1.f;
++    __try {
++        if (!w.part || !readable(w.part, woundPartCharacter + 8)) return;
++        w.owner = *(const uintptr_t*)(w.part + woundPartCharacter);
++        if (h.victim && readable(uintptr_t(h.victim), field::character::healthMax + 4))
++            healthMax = *(const float*)(uintptr_t(h.victim) + field::character::healthMax);
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        woundFaults.fetch_add(1, std::memory_order_relaxed);
++        return;
++    }
++    if (!w.owner || w.owner != uintptr_t(h.victim) || !intoPose(h.pose, h.point, true, w.local)) return;
++    if (!intoPose(h.pose, h.direction, false, w.along)) memset(w.along, 0, sizeof w.along);
++    if (!std::isfinite(healthMax) || healthMax < 0.05f) healthMax = 1.f;
++    // PROVISIONAL(2026-10-22, size from damage: a third of full health fills the scale; tune after
++    // Hunter's first look, ratify-by: 2026-11-05)
++    w.severity = kind == woundCrush ? std::clamp(0.35f + 0.8f * balance, 0.35f, 1.f)
++                                    : std::clamp(0.35f + 2.f * health / healthMax, 0.35f, 1.f);
++    w.kind = kind;
++    w.born = GetTickCount64();
++    w.seed = float((h.serial * 2654435761u) >> 8) / float(1u << 24);
++    switch (kind) {
++    case woundCut: w.halfLength = 4.f + 7.f * w.severity; w.halfWidth = 0.35f + 0.5f * w.severity; break;
++    case woundThrust: w.halfLength = 1.f + 0.8f * w.severity; w.halfWidth = 0.6f + 0.4f * w.severity; break;
++    default: w.halfLength = 3.f + 4.f * w.severity; w.halfWidth = 0.f; break;
++    }
++    // A blow landing on a mark of the same kind deepens it; a part keeps its newest few marks.
++    unsigned onPart = 0, oldest = woundLimit;
++    for (unsigned i = 0; i < woundLimit; ++i) {
++        Wound& e = woundStore[i];
++        if (e.part != w.part || e.owner != w.owner) continue;
++        const float dx = e.local[0] - w.local[0], dy = e.local[1] - w.local[1], dz = e.local[2] - w.local[2];
++        if (e.kind == w.kind && dx * dx + dy * dy + dz * dz < woundMergeCm * woundMergeCm) {
++            e.severity = (std::min)(e.severity + 0.5f * w.severity, 1.f);
++            e.halfLength = (std::max)(e.halfLength, w.halfLength);
++            e.halfWidth = (std::max)(e.halfWidth, w.halfWidth);
++            e.born = w.born;
++            return;
++        }
++        ++onPart;
++        if (oldest == woundLimit || e.born < woundStore[oldest].born) oldest = i;
++    }
++    if (onPart >= woundsPerPart) {
++        woundStore[oldest] = w;
++    } else {
++        woundStore[woundNext] = w;
++        woundNext = (woundNext + 1) % woundLimit;
++    }
++    woundsTaken.fetch_add(1, std::memory_order_relaxed);
++}
++
++static void takeHits() {
++    const CharacterHits fn = characterHitsExport();
++    if (!fn) return;
++    CharacterHitRecord hits[16];
++    for (int round = 0; round < 4; ++round) { // at most 64 new hits a frame
++        int count = 0;
++        __try { count = fn(woundSerial, hits, 16); }
++        __except (EXCEPTION_EXECUTE_HANDLER) {
++            woundFaults.fetch_add(1, std::memory_order_relaxed);
++            return;
++        }
++        for (int k = 0; k < (std::min)(count, 16); ++k) {
++            if (hits[k].size != sizeof(CharacterHitRecord)) return;
++            woundSerial = hits[k].serial; // oldest first
++            addWound(hits[k]);
++        }
++        if (count < 16) return;
++    }
++}
++
++// The marks for one view: each live mark's centre and path from its part's pose now, in the native view
++// space (row-major view matrix), nearest first. Whether the view takes sector-local or global points
++// is not established here, so both readings are tried as for the held items and the nearer wins.
++static void woundViewUniforms(const float* view, WoundUniforms& out) {
++    out.count = 0;
++    if (woundMarks.load(std::memory_order_relaxed) <= 0.f) return;
++    struct Shown { float distanceSq; float centre[3], path[3]; unsigned index; };
++    Shown shown[woundLimit];
++    unsigned visible = 0;
++    const ULONGLONG now = GetTickCount64();
++    AcquireSRWLockExclusive(&woundLock);
++    takeHits();
++    for (unsigned i = 0; i < woundLimit; ++i) {
++        Wound& w = woundStore[i];
++        if (!w.part) continue;
++        float pose[12], sectorOrigin[3]{};
++        uintptr_t owner = 0;
++        bool read = false;
++        __try {
++            if (readable(w.part, woundPartCharacter + 8)) {
++                owner = *(const uintptr_t*)(w.part + woundPartCharacter);
++                memcpy(pose, (const void*)(w.part + field::bodyPart::pose), sizeof pose);
++                const uintptr_t node = *(const uintptr_t*)(w.part + field::bodyPart::meshNode);
++                const uintptr_t sector = node && readable(node, field::sceneNode::sector + 8)
++                                             ? *(const uintptr_t*)(node + field::sceneNode::sector) : 0;
++                if (sector && readable(sector, field::sector::origin + 12))
++                    memcpy(sectorOrigin, (const void*)(sector + field::sector::origin), sizeof sectorOrigin);
++                read = true;
++            }
++        } __except (EXCEPTION_EXECUTE_HANDLER) {
++            woundFaults.fetch_add(1, std::memory_order_relaxed);
++        }
++        if (!read || owner != w.owner) { // the character is gone, or the part was freed or reused
++            w = {};
++            woundsRetired.fetch_add(1, std::memory_order_relaxed);
++            continue;
++        }
++        float world[3], path[3];
++        outOfPose(pose, w.local, true, world);
++        outOfPose(pose, w.along, false, path);
++        Shown s{};
++        s.distanceSq = woundReachCm * woundReachCm;
++        bool found = false;
++        for (int candidate = 0; candidate < 2; ++candidate) {
++            float p[3], c[3];
++            for (int k = 0; k < 3; ++k) p[k] = world[k] + (candidate ? sectorOrigin[k] : 0.f);
++            for (int k = 0; k < 3; ++k) c[k] = p[0] * view[k] + p[1] * view[4 + k] + p[2] * view[8 + k] + view[12 + k];
++            const float sq = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
++            if (std::isfinite(sq) && sq < s.distanceSq && c[2] < 20.f) { // not behind the camera (it looks down -z)
++                s.distanceSq = sq;
++                memcpy(s.centre, c, sizeof c);
++                found = true;
++            }
++            if (!candidate && !(sectorOrigin[0] || sectorOrigin[1] || sectorOrigin[2])) break;
++        }
++        if (!found) continue;
++        for (int k = 0; k < 3; ++k) s.path[k] = path[0] * view[k] + path[1] * view[4 + k] + path[2] * view[8 + k];
++        const float pathSq = s.path[0] * s.path[0] + s.path[1] * s.path[1] + s.path[2] * s.path[2];
++        if (std::isfinite(pathSq) && pathSq > 1e-8f) {
++            const float inverse = 1.f / std::sqrt(pathSq);
++            for (float& v : s.path) v *= inverse;
++        } else {
++            memset(s.path, 0, sizeof s.path); // the shader picks a direction on the surface
++        }
++        s.index = i;
++        shown[visible++] = s;
++    }
++    const unsigned count = (std::min)(visible, woundShownLimit);
++    std::partial_sort(shown, shown + count, shown + visible,
++                      [](const Shown& l, const Shown& r) { return l.distanceSq < r.distanceSq; });
++    for (unsigned k = 0; k < count; ++k) {
++        const Shown& s = shown[k];
++        const Wound& w = woundStore[s.index];
++        // Fresh cuts bleed: the runs lengthen over the first half minute.
++        const float age = float(now - w.born) / 1000.f;
++        const float run = w.kind == woundCrush ? 0.f : (std::min)(age / 30.f, 1.f) * (4.f + 14.f * w.severity);
++        const float a[4] = {s.centre[0], s.centre[1], s.centre[2], w.halfLength};
++        const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind)};
++        const float c[4] = {w.severity, w.seed, w.halfWidth, run};
++        memcpy(out.a[k], a, sizeof a);
++        memcpy(out.b[k], b, sizeof b);
++        memcpy(out.c[k], c, sizeof c);
++    }
++    out.count = count;
++    ReleaseSRWLockExclusive(&woundLock);
++}

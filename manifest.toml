@@ -1,0 +1,29 @@
+[plugin]
+name = "Injuries"
+version = "0.2.0"
+category = "Gameplay"
+
+[script]
+runtime = "com.necrosis.script-runtime"
+entry = "scripts/main.lua"
+requires = ["events.lifecycle", "timers", "events.combat"]
+# characters.limb_strength is requested from the runtime (RUNTIME-REQUESTS.md, section 2);
+# without it injuries are tracked and logged but limbs keep their strength.
+# A broken neck kills through the game's own damage applier: player.damage for the player,
+# characters.damage on a characters.read entry for others.
+optional = ["characters.limb_strength", "items.stats", "ui.settings", "ui.notify", "storage.save",
+            "player.damage", "characters.damage", "characters.read", "characters.marks",
+            "characters.drop_held", "characters.soil_worn", "characters.sever", "characters.keep_down"]
+# characters.sever (runtime 0.28.0-r50, arms only): a hard cut takes an arm off at the shoulder or elbow,
+# and the hand drops what it held. Legs wait for characters.keep_down (requested, section 7).
+# Burns arrive from the Fire mod on addons topic "injuries.burn"; "injuries.burn" (0..255) is ExCamera's
+# baked scorch; characters.soil_worn (requested, section 4) soots and wears what a burning character wears.
+# characters.drop_held (runtime 0.28.0-r50): a badly broken arm drops what its hand holds.
+# "injuries.broken" (bits per limb bone) is ExCamera's fracture bruise.
+# Other mods heal through the runtime's addon channel: addons.send("com.necrosis.injuries",
+# "injuries.heal", {target, amount}); the "injuries.mend" mark tells ExCamera to close the
+# painted wounds meanwhile.
+
+[script.modules]
+config = "scripts/config.lua"
+injuries = "scripts/injuries.lua"

@@ -1,0 +1,521 @@
+diff --git src/cue_resources.h src/cue_resources.h
+index 9590fd8..cdaace9 100644
+--- src/cue_resources.h
++++ src/cue_resources.h
+@@ -53,6 +53,8 @@ struct CueResources {
+     int viewDepthFormat = 0; // both copies' internal format; 0 until defined
+     unsigned aoProgram = 0, ssrProgram = 0, dofProgram = 0, finishProgram = 0, compositeProgram = 0,
+              resolveProgram = 0, dofCompositeProgram = 0, meterProgram = 0, distanceProgram = 0;
++    // Wound marks' own pass (view_effects.inl): program, framebuffer over the image, the box's quad.
++    unsigned woundProgram = 0, woundFbo = 0, woundQuadVao = 0, woundQuadVbo = 0;
+     // Ambient occlusion and reflections render at half resolution: [0] occlusion, [1] reflection.
+     unsigned halfFbo[2]{}, halfTex[2]{};
+     // Their blend over frames, same size and lifetime: [effect][ping-pong]. historySlot
+@@ -94,7 +96,7 @@ struct CueResources {
+     bool viewLive() const {
+         return viewVao || viewVbo || viewColor || viewDepth || viewDepthPrevious || offscreenFbo ||
+                offscreenDepthFbo || timerQueries[0][0] ||
+-               timerQueries[1][0] || timerQueries[2][0] || timerQueries[3][0] || aoProgram || ssrProgram || dofProgram || finishProgram ||
++               timerQueries[1][0] || timerQueries[2][0] || timerQueries[3][0] || aoProgram || ssrProgram || dofProgram || finishProgram || woundProgram || woundFbo || woundQuadVao || woundQuadVbo ||
+                compositeProgram || resolveProgram || chainTex || chainFbo[0] || chainFbo[1] || dofCompositeProgram || dofFbo || dofTex || distanceProgram || distanceFbo || distanceTex || halfFbo[0] || halfFbo[1] || halfTex[0] || halfTex[1] ||
+                historyFbo[0][0] || historyFbo[0][1] || historyFbo[1][0] || historyFbo[1][1] ||
+                historyTex[0][0] || historyTex[0][1] || historyTex[1][0] || historyTex[1][1] ||
+@@ -238,6 +240,11 @@ struct CueResources {
+         retireProgram(g, dofCompositeProgram);
+         retireProgram(g, meterProgram);
+         retireProgram(g, distanceProgram);
++        retireProgram(g, woundProgram);
++        if (woundFbo && g.deleteFramebuffers) g.deleteFramebuffers(1, &woundFbo);
++        if (woundQuadVao) g.deleteVertexArrays(1, &woundQuadVao);
++        if (woundQuadVbo) g.deleteBuffers(1, &woundQuadVbo);
++        woundFbo = woundQuadVao = woundQuadVbo = 0;
+         retireMeter(g);
+         retireSilhouette(g);
+         if (heldNoise) g.deleteTextures(1, &heldNoise);
+diff --git src/mod/overlay.inl src/mod/overlay.inl
+index 83005f3..90449d1 100644
+--- src/mod/overlay.inl
++++ src/mod/overlay.inl
+@@ -259,7 +259,7 @@ struct CueContext {
+     bool viewApiAttempted = false, viewApiFailed = false, viewTargetsFailed = false;
+     bool aoAttempted = false, ssrAttempted = false, dofAttempted = false, finishAttempted = false,
+          compositeAttempted = false, resolveAttempted = false, dofCompositeAttempted = false,
+-         meterAttempted = false, distanceAttempted = false;
++         meterAttempted = false, distanceAttempted = false, woundAttempted = false;
+     // Occlusion/reflection blending over frames: the camera of the last blended frame.
+     unsigned viewFrame = 1;      // counts blended frames; history written in frame f is usable in f + 1
+     ULONGLONG previousTick = 0;  // when the last blended frame was drawn
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 3ade99f..110c739 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -522,148 +522,6 @@ uniform vec4 levelRow2;
+ uniform vec4 levelPeople[6];
+ uniform sampler3D heldNoise; // tiling smooth noise, 16 units a tile (held-item surfaces)
+ uniform vec4 worldUp;      // world +Y in view space; w unused
+-uniform vec4 woundA[12];   // a wound's view-space centre; w: half length, cm (a bruise's radius)
+-uniform vec4 woundB[12];   // the blade's path, view space; w: kind (1 cut, 2 crush, 3 thrust) + 0.98 x a cut's
+-                           // wetness or a bruise's age, 0..1
+-uniform vec4 woundC[12];   // severity 0..1, seed (negative: the skin part is baked into the skin texture), half width (cm),
+-                           // length of the blood runs (cm)
+-uniform float woundCount;
+-uniform vec4 woundRect;    // screen box (uv min xy, max zw) that holds every wound's reach; outside it nothing to do
+-
+-float woundHash(float x) {
+-    return fract(sin(x * 12.9898) * 43758.5453);
+-}
+-
+-// Wounds (wounds.inl) on the surface where they landed. They multiply the light already there, so a
+-// wound in shadow stays in shadow; only wet blood adds a little shine, scaled by that same light.
+-vec3 woundMarks(vec3 color) {
+-    if (uv.x < woundRect.x || uv.y < woundRect.y || uv.x > woundRect.z || uv.y > woundRect.w) return color;
+-    float raw = texture2D(depthTex, uv).r;
+-    if (raw >= skyDepth) return color;
+-    vec3 p = viewPosition(uv, raw);
+-    vec3 n = vec3(0.0, 0.0, 1.0);
+-    bool near = false;
+-    vec3 tint = vec3(1.0);
+-    float wet = 0.0;
+-    float grey = 0.0;
+-    for (int i = 0; i < 12; ++i) {
+-        if (float(i) >= woundCount) break;
+-        vec4 A = woundA[i], B = woundB[i], C = woundC[i];
+-        vec3 d = p - A.xyz;
+-        float reach = A.w + C.w + 6.0;
+-        if (dot(d, d) > reach * reach) continue;
+-        if (!near) {
+-            n = viewNormal(uv, p);
+-            near = true;
+-            // A grey, unsaturated surface is taken for metal: it takes blood smears and runs but no tear or soak.
+-            vec3 base = toLight(color);
+-            float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
+-            grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
+-        }
+-        // The hit point lies on the body, so a surface well in front of it along its normal is an outer
+-        // layer: cloth, padding or armour (inferred from geometry; a loose collision shape can blur it).
+-        float off = dot(d, n);
+-        float layer = smoothstep(0.6, 1.6, off);
+-        float metal = layer * grey, cloth = layer * (1.0 - grey);
+-        // Only the surface at the wound: something a few cm off it (another limb, a wall behind) is left alone.
+-        float stick = 1.0 - smoothstep(2.0 + 2.5 * layer, 4.5 + 2.5 * layer, abs(off));
+-        if (stick <= 0.0) continue;
+-        vec3 t = B.xyz - n * dot(B.xyz, n);
+-        if (dot(t, t) < 1e-4) t = cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
+-        t = normalize(t);
+-        vec3 s = cross(n, t);
+-        vec2 q = vec2(dot(d, t), dot(d, s)); // cm along the blade's path and across it, on the surface
+-        float baked = C.y < 0.0 ? 1.0 : 0.0;
+-        float severity = C.x, seed = abs(C.y);
+-        float kind = floor(B.w + 0.01), aux = clamp((B.w - kind) / 0.98, 0.0, 1.0);
+-        if (kind == 2.0) {
+-            // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
+-            float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
+-            float r = length(q) / (A.w * mottle);
+-            float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick * (1.0 - layer) * (1.0 - baked); // skin only
+-            // Fresh it is an angry red swelling; over the next minute and a half it darkens to purple.
+-            vec3 outer = mix(vec3(0.85, 0.42, 0.4), vec3(0.62, 0.45, 0.62), aux);
+-            vec3 inner = mix(vec3(0.6, 0.18, 0.16), vec3(0.42, 0.17, 0.2), aux);
+-            vec3 bruise = mix(outer, inner, 1.0 - smoothstep(0.0, 0.7, r));
+-            float graze = severity > 0.6 ? step(0.8, woundHash(floor(q.x * 2.0) + floor(q.y * 2.0) * 57.0 + seed * 101.0)) *
+-                                               (1.0 - smoothstep(0.0, 0.45, r)) : 0.0;
+-            tint *= mix(vec3(1.0), mix(bruise, vec3(0.35, 0.05, 0.04), graze), w);
+-            continue;
+-        }
+-        // A cut, or a thrust's short deep hole: a lens-shaped gash darkest at its depth, swollen lips,
+-        // blood smeared around it, and fresh blood running down from it.
+-        float a = q.x / A.w;
+-        float taper = sqrt(max(1.0 - a * a, 0.0));
+-        float wobble = 0.22 * C.z * sin(a * 5.0 + seed * 40.0);
+-        float x = abs(q.y - wobble) / max(C.z * (0.25 + 0.75 * taper), 0.05);
+-        float inside = taper > 0.0 ? 1.0 - smoothstep(0.6, 1.0, x) : 0.0;
+-        float lip = taper * smoothstep(0.7, 1.1, x) * (1.0 - smoothstep(1.3, 2.4, x));
+-        float smear = (1.0 - smoothstep(1.2, 4.0, x)) * (1.0 - smoothstep(0.8, 1.25, abs(a))) *
+-                      (0.6 + 0.4 * woundHash(floor(q.x * 1.5 + seed * 13.0) + floor(q.y * 1.5) * 31.0));
+-        float facing = dot(worldUp.xyz, s) * sign(q.y - wobble); // the lip facing up catches the light
+-        // Wet blood is bright red; dried blood goes dark brown.
+-        vec3 blood = mix(vec3(0.3, 0.08, 0.05), vec3(0.32, 0.02, 0.018), aux);
+-        vec3 cut = mix(vec3(1.0), mix(vec3(0.55, 0.3, 0.24), vec3(0.7, 0.22, 0.2), aux), smear * (0.55 + 0.35 * severity));
+-        cut = mix(cut, vec3(1.0, 0.5, 0.45) * (1.0 + 0.3 * facing), lip * 0.8);
+-        cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
+-        // Through cloth or padding: a ragged slit with frayed threads at its edge and the dark wound behind,
+-        // and blood soaking outward through the weave, wider the longer the wound bleeds, with a dried rim.
+-        float rag = 0.35 * (woundHash(floor(q.x * 3.0) + seed * 17.0) - 0.5);
+-        float xs = abs(q.y - wobble) / max(C.z * 0.7 * taper, 0.05) + rag;
+-        float slit = taper > 0.0 ? 1.0 - smoothstep(0.5, 0.9, xs) : 0.0;
+-        float fray = taper * smoothstep(0.8, 1.0, xs) * (1.0 - smoothstep(1.0, 1.9, xs)) *
+-                     step(0.45, fract(q.x * 2.5 + woundHash(floor(q.x * 2.5) + seed)));
+-        float spread = A.w * 0.5 + C.z * 2.0 + C.w * 0.45;
+-        float e = length(vec2(q.x / (A.w * 1.1 + C.w * 0.2), q.y / spread)) *
+-                  (0.8 + 0.4 * woundHash(floor(q.x * 0.8) + floor(q.y * 0.8) * 13.0 + seed * 7.0));
+-        float soak = (1.0 - smoothstep(0.75, 1.0, e)) * (0.5 + 0.5 * severity);
+-        float tide = smoothstep(0.7, 0.9, e) * (1.0 - smoothstep(0.9, 1.0, e));
+-        vec3 stain = mix(vec3(0.42, 0.16, 0.12), vec3(0.5, 0.07, 0.06), aux);
+-        vec3 fabric = mix(vec3(1.0), stain, soak * 0.85);
+-        fabric = mix(fabric, stain * 0.7, tide * 0.5);
+-        fabric = mix(fabric, fabric * 0.65, fray);
+-        fabric = mix(fabric, vec3(0.1, 0.02, 0.02), slit);
+-        vec3 plate = mix(vec3(1.0), blood * 1.6, smear * 0.6);
+-        cut = mix(cut, vec3(1.0), baked * (1.0 - layer)); // the skin already carries it
+-        cut = mix(cut, fabric, cloth);
+-        cut = mix(cut, plate, metal);
+-        inside = mix(inside, slit, cloth) * (1.0 - metal);
+-        float run = 0.0;
+-        vec3 down = n * dot(worldUp.xyz, n) - worldUp.xyz; // straight down, along the surface
+-        if (C.w > 0.0 && dot(down, down) > 0.04) {
+-            down = normalize(down);
+-            vec3 side = cross(n, down);
+-            float below = dot(d, down), across = dot(d, side);
+-            float ts = dot(t, side), td = dot(t, down);
+-            float thick = 0.2 + 0.25 * severity;
+-            for (int k = 0; k < 3; ++k) {
+-                float fk = float(k);
+-                float at = (woundHash(seed * 7.0 + fk) * 2.0 - 1.0) * (abs(ts) * A.w * 0.8 + C.z);
+-                // Each run leaves the cut where the cut crosses its line; a cut running downhill bleeds from its low end.
+-                float start = abs(ts) > 0.2 ? clamp(at / ts, -A.w, A.w) * td : A.w * abs(td);
+-                if (abs(ts) <= 0.2) at = 0.4 * (fk - 1.0) * C.z;
+-                float len = C.w * (0.45 + 0.55 * woundHash(seed * 3.0 + fk + 5.0));
+-                float along = below - start;
+-                float bead = 1.0 + 0.8 * smoothstep(len * 0.7, len, along);
+-                float line = 1.0 - smoothstep(thick * bead * 0.5, thick * bead, abs(across - at - 0.3 * sin(below * 0.4 + fk)));
+-                run = max(run, line * step(0.0, along) * (1.0 - smoothstep(len * 0.85, len, along)));
+-            }
+-            cut = mix(cut, blood, run * 0.9 * (1.0 - 0.7 * cloth)); // cloth drinks most of it
+-        }
+-        tint *= mix(vec3(1.0), cut, stick);
+-        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux) * (1.0 - 0.6 * cloth);
+-    }
+-    if (!near) return color;
+-    vec3 lit = toLight(color);
+-    float level = dot(lit, vec3(0.2126, 0.7152, 0.0722));
+-    lit *= tint;
+-    if (wet > 0.0) {
+-        vec3 lightDir = normalize(worldUp.xyz * 0.8 + vec3(0.0, 0.0, 0.6));
+-        float spec = pow(max(dot(n, normalize(lightDir + normalize(-p))), 0.0), 24.0);
+-        lit += vec3(0.9, 0.55, 0.5) * spec * min(wet, 1.0) * level * (0.4 + 2.5 * level);
+-    }
+-    return toStored(clamp(lit, 0.0, 1.0));
+-}
+ 
+ float lumaAt(vec2 p) {
+     return dot(texture2D(sceneTex, p).rgb, vec3(0.299, 0.587, 0.114));
+@@ -1199,7 +1057,6 @@ void main() {
+     }
+     // Level surfaces: pixels no held item, worn gear or world object claims, near the camera.
+     if (levelDetail.x > 0.0 && (levelDetail.w < 0.5 || maskCode > 254.5)) color = levelSurface(color);
+-    if (woundCount > 0.0) color = woundMarks(color); // on the surface itself, before any blur
+     // Occlusion and reflections are low-frequency: applied after the edge passes they look
+     // the same as before them, and this pass then needs no neighbouring shaded pixels.
+     // Sharpened or smoothed first, then blurred where out of focus: blurred areas need neither.
+@@ -1274,6 +1131,160 @@ void main() {
+ }
+ )glsl";
+ 
++// Wound marks (wounds.inl), their own pass before the finishing pass: drawn only over the wounds'
++// screen box onto the image the finishing pass will read, each pixel reading and rewriting itself
++// (a texture barrier on either side). Kept out of the finishing program, which every frame runs.
++static const char* const woundShader = R"glsl(
++uniform vec4 worldUp;      // world +Y in view space; w unused
++uniform vec4 woundA[12];   // a wound's view-space centre; w: half length, cm (a bruise's radius)
++uniform vec4 woundB[12];   // the blade's path, view space; w: kind (1 cut, 2 crush, 3 thrust) + 0.98 x a cut's
++                           // wetness or a bruise's age, 0..1
++uniform vec4 woundC[12];   // severity 0..1, seed (negative: the skin part is baked into the skin texture), half width (cm),
++                           // length of the blood runs (cm)
++uniform float woundCount;
++uniform vec4 woundRect;    // screen box (uv min xy, max zw) that holds every wound's reach; outside it nothing to do
++
++float woundHash(float x) {
++    return fract(sin(x * 12.9898) * 43758.5453);
++}
++
++// Wounds (wounds.inl) on the surface where they landed. They multiply the light already there, so a
++// wound in shadow stays in shadow; only wet blood adds a little shine, scaled by that same light.
++vec3 woundMarks(vec3 color) {
++    if (uv.x < woundRect.x || uv.y < woundRect.y || uv.x > woundRect.z || uv.y > woundRect.w) return color;
++    float raw = texture2D(depthTex, uv).r;
++    if (raw >= skyDepth) return color;
++    vec3 p = viewPosition(uv, raw);
++    vec3 n = vec3(0.0, 0.0, 1.0);
++    bool near = false;
++    vec3 tint = vec3(1.0);
++    float wet = 0.0;
++    float grey = 0.0;
++    for (int i = 0; i < 12; ++i) {
++        if (float(i) >= woundCount) break;
++        vec4 A = woundA[i], B = woundB[i], C = woundC[i];
++        vec3 d = p - A.xyz;
++        float reach = A.w + C.w + 6.0;
++        if (dot(d, d) > reach * reach) continue;
++        if (!near) {
++            n = viewNormal(uv, p);
++            near = true;
++            // A grey, unsaturated surface is taken for metal: it takes blood smears and runs but no tear or soak.
++            vec3 base = toLight(color);
++            float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
++            grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
++        }
++        // The hit point lies on the body, so a surface well in front of it along its normal is an outer
++        // layer: cloth, padding or armour (inferred from geometry; a loose collision shape can blur it).
++        float off = dot(d, n);
++        float layer = smoothstep(0.6, 1.6, off);
++        float metal = layer * grey, cloth = layer * (1.0 - grey);
++        // Only the surface at the wound: something a few cm off it (another limb, a wall behind) is left alone.
++        float stick = 1.0 - smoothstep(2.0 + 2.5 * layer, 4.5 + 2.5 * layer, abs(off));
++        if (stick <= 0.0) continue;
++        vec3 t = B.xyz - n * dot(B.xyz, n);
++        if (dot(t, t) < 1e-4) t = cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
++        t = normalize(t);
++        vec3 s = cross(n, t);
++        vec2 q = vec2(dot(d, t), dot(d, s)); // cm along the blade's path and across it, on the surface
++        float baked = C.y < 0.0 ? 1.0 : 0.0;
++        float severity = C.x, seed = abs(C.y);
++        float kind = floor(B.w + 0.01), aux = clamp((B.w - kind) / 0.98, 0.0, 1.0);
++        if (kind == 2.0) {
++            // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
++            float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
++            float r = length(q) / (A.w * mottle);
++            float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick * (1.0 - layer) * (1.0 - baked); // skin only
++            // Fresh it is an angry red swelling; over the next minute and a half it darkens to purple.
++            vec3 outer = mix(vec3(0.85, 0.42, 0.4), vec3(0.62, 0.45, 0.62), aux);
++            vec3 inner = mix(vec3(0.6, 0.18, 0.16), vec3(0.42, 0.17, 0.2), aux);
++            vec3 bruise = mix(outer, inner, 1.0 - smoothstep(0.0, 0.7, r));
++            float graze = severity > 0.6 ? step(0.8, woundHash(floor(q.x * 2.0) + floor(q.y * 2.0) * 57.0 + seed * 101.0)) *
++                                               (1.0 - smoothstep(0.0, 0.45, r)) : 0.0;
++            tint *= mix(vec3(1.0), mix(bruise, vec3(0.35, 0.05, 0.04), graze), w);
++            continue;
++        }
++        // A cut, or a thrust's short deep hole: a lens-shaped gash darkest at its depth, swollen lips,
++        // blood smeared around it, and fresh blood running down from it.
++        float a = q.x / A.w;
++        float taper = sqrt(max(1.0 - a * a, 0.0));
++        float wobble = 0.22 * C.z * sin(a * 5.0 + seed * 40.0);
++        float x = abs(q.y - wobble) / max(C.z * (0.25 + 0.75 * taper), 0.05);
++        float inside = taper > 0.0 ? 1.0 - smoothstep(0.6, 1.0, x) : 0.0;
++        float lip = taper * smoothstep(0.7, 1.1, x) * (1.0 - smoothstep(1.3, 2.4, x));
++        float smear = (1.0 - smoothstep(1.2, 4.0, x)) * (1.0 - smoothstep(0.8, 1.25, abs(a))) *
++                      (0.6 + 0.4 * woundHash(floor(q.x * 1.5 + seed * 13.0) + floor(q.y * 1.5) * 31.0));
++        float facing = dot(worldUp.xyz, s) * sign(q.y - wobble); // the lip facing up catches the light
++        // Wet blood is bright red; dried blood goes dark brown.
++        vec3 blood = mix(vec3(0.3, 0.08, 0.05), vec3(0.32, 0.02, 0.018), aux);
++        vec3 cut = mix(vec3(1.0), mix(vec3(0.55, 0.3, 0.24), vec3(0.7, 0.22, 0.2), aux), smear * (0.55 + 0.35 * severity));
++        cut = mix(cut, vec3(1.0, 0.5, 0.45) * (1.0 + 0.3 * facing), lip * 0.8);
++        cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
++        // Through cloth or padding: a ragged slit with frayed threads at its edge and the dark wound behind,
++        // and blood soaking outward through the weave, wider the longer the wound bleeds, with a dried rim.
++        float rag = 0.35 * (woundHash(floor(q.x * 3.0) + seed * 17.0) - 0.5);
++        float xs = abs(q.y - wobble) / max(C.z * 0.7 * taper, 0.05) + rag;
++        float slit = taper > 0.0 ? 1.0 - smoothstep(0.5, 0.9, xs) : 0.0;
++        float fray = taper * smoothstep(0.8, 1.0, xs) * (1.0 - smoothstep(1.0, 1.9, xs)) *
++                     step(0.45, fract(q.x * 2.5 + woundHash(floor(q.x * 2.5) + seed)));
++        float spread = A.w * 0.5 + C.z * 2.0 + C.w * 0.45;
++        float e = length(vec2(q.x / (A.w * 1.1 + C.w * 0.2), q.y / spread)) *
++                  (0.8 + 0.4 * woundHash(floor(q.x * 0.8) + floor(q.y * 0.8) * 13.0 + seed * 7.0));
++        float soak = (1.0 - smoothstep(0.75, 1.0, e)) * (0.5 + 0.5 * severity);
++        float tide = smoothstep(0.7, 0.9, e) * (1.0 - smoothstep(0.9, 1.0, e));
++        vec3 stain = mix(vec3(0.42, 0.16, 0.12), vec3(0.5, 0.07, 0.06), aux);
++        vec3 fabric = mix(vec3(1.0), stain, soak * 0.85);
++        fabric = mix(fabric, stain * 0.7, tide * 0.5);
++        fabric = mix(fabric, fabric * 0.65, fray);
++        fabric = mix(fabric, vec3(0.1, 0.02, 0.02), slit);
++        vec3 plate = mix(vec3(1.0), blood * 1.6, smear * 0.6);
++        cut = mix(cut, vec3(1.0), baked * (1.0 - layer)); // the skin already carries it
++        cut = mix(cut, fabric, cloth);
++        cut = mix(cut, plate, metal);
++        inside = mix(inside, slit, cloth) * (1.0 - metal);
++        float run = 0.0;
++        vec3 down = n * dot(worldUp.xyz, n) - worldUp.xyz; // straight down, along the surface
++        if (C.w > 0.0 && dot(down, down) > 0.04) {
++            down = normalize(down);
++            vec3 side = cross(n, down);
++            float below = dot(d, down), across = dot(d, side);
++            float ts = dot(t, side), td = dot(t, down);
++            float thick = 0.2 + 0.25 * severity;
++            for (int k = 0; k < 3; ++k) {
++                float fk = float(k);
++                float at = (woundHash(seed * 7.0 + fk) * 2.0 - 1.0) * (abs(ts) * A.w * 0.8 + C.z);
++                // Each run leaves the cut where the cut crosses its line; a cut running downhill bleeds from its low end.
++                float start = abs(ts) > 0.2 ? clamp(at / ts, -A.w, A.w) * td : A.w * abs(td);
++                if (abs(ts) <= 0.2) at = 0.4 * (fk - 1.0) * C.z;
++                float len = C.w * (0.45 + 0.55 * woundHash(seed * 3.0 + fk + 5.0));
++                float along = below - start;
++                float bead = 1.0 + 0.8 * smoothstep(len * 0.7, len, along);
++                float line = 1.0 - smoothstep(thick * bead * 0.5, thick * bead, abs(across - at - 0.3 * sin(below * 0.4 + fk)));
++                run = max(run, line * step(0.0, along) * (1.0 - smoothstep(len * 0.85, len, along)));
++            }
++            cut = mix(cut, blood, run * 0.9 * (1.0 - 0.7 * cloth)); // cloth drinks most of it
++        }
++        tint *= mix(vec3(1.0), cut, stick);
++        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux) * (1.0 - 0.6 * cloth);
++    }
++    if (!near) return color;
++    vec3 lit = toLight(color);
++    float level = dot(lit, vec3(0.2126, 0.7152, 0.0722));
++    lit *= tint;
++    if (wet > 0.0) {
++        vec3 lightDir = normalize(worldUp.xyz * 0.8 + vec3(0.0, 0.0, 0.6));
++        float spec = pow(max(dot(n, normalize(lightDir + normalize(-p))), 0.0), 24.0);
++        lit += vec3(0.9, 0.55, 0.5) * spec * min(wet, 1.0) * level * (0.4 + 2.5 * level);
++    }
++    return toStored(clamp(lit, 0.0, 1.0));
++}
++
++void main() {
++    vec4 c = texture2D(sceneTex, uv);
++    gl_FragColor = vec4(woundMarks(c.rgb), c.a);
++}
++)glsl";
++
+ // Uniform names shared by all programs; a program that does not use one
+ // gets location -1, which glUniform ignores. Never treat -1 as a failure:
+ // drivers strip uniforms a shader does not read.
+@@ -1295,7 +1306,7 @@ static const char* const viewUniformNames[viewUniformCount] = {
+ struct ViewProgramUniforms { GLint at[viewUniformCount]; };
+ enum ViewProgram : unsigned {
+     programAo, programSsr, programDof, programFinish, programComposite, programResolve, programDofComposite,
+-    programMeter, programDistance, programCount
++    programMeter, programDistance, programWounds, programCount
+ };
+ static ViewProgramUniforms viewUniforms[8][programCount]; // [cue context][ViewProgram]; cueLock
+ 
+@@ -1305,7 +1316,7 @@ enum ViewEffectUnavailable : unsigned {
+     viewHookMissing = 1, viewApiMissing = 2, viewTargetsFailed = 4, viewAoFailed = 8, viewSsrFailed = 16,
+     viewDofFailed = 32, viewFaulted = 64, viewFinishFailed = 128, viewCompositeFailed = 256, viewResolveFailed = 512,
+     viewDofCompositeFailed = 1024, viewMeterFailed = 2048,
+-    viewDistanceFailed = 4096
++    viewDistanceFailed = 4096, viewWoundsFailed = 8192
+ };
+ static std::atomic<unsigned> viewEffectsUnavailable{0};
+ static char viewEffectsReason[256];
+@@ -1916,6 +1927,24 @@ struct ViewFrame {
+     bool encoded;
+ };
+ 
++using WoundBarrier = void(APIENTRY*)();
++static WoundBarrier woundBarrier = nullptr;
++static void woundTextureBarrier() {
++    if (woundBarrier) woundBarrier();
++}
++// The wound pass's framebuffer and quad, and the barrier that lets a pixel read and rewrite itself
++// (GL 4.5 or NV_texture_barrier); without it the pass stays off.
++static bool woundPassReady(gl::Api& g, fp::CueResources& r) {
++    if (!woundBarrier && !loadGl(woundBarrier, "glTextureBarrier") && !loadGl(woundBarrier, "glTextureBarrierNV")) {
++        woundBarrier = nullptr;
++        return false;
++    }
++    if (!r.woundFbo && g.genFramebuffers) g.genFramebuffers(1, &r.woundFbo);
++    if (!r.woundQuadVao) g.genVertexArrays(1, &r.woundQuadVao);
++    if (!r.woundQuadVbo) g.genBuffers(1, &r.woundQuadVbo);
++    return r.woundFbo && r.woundQuadVao && r.woundQuadVbo;
++}
++
+ static void setViewUniforms(gl::Api& g, const ViewProgramUniforms& u, const ViewFrame& f) {
+     g.uniform1i(u.at[uScene], 0);
+     g.uniform1i(u.at[uDepth], 1);
+@@ -2311,7 +2340,7 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+         owner->viewTargetsFailed = false;
+         owner->aoAttempted = owner->ssrAttempted = owner->dofAttempted = owner->finishAttempted =
+             owner->compositeAttempted = owner->resolveAttempted = owner->dofCompositeAttempted =
+-            owner->meterAttempted = owner->distanceAttempted = false;
++            owner->meterAttempted = owner->distanceAttempted = owner->woundAttempted = false;
+     }
+     // Multi-output routing is checked on audit frames (see above).
+     if (audit) owner->viewOutputsReady = cueOutputReady(g);
+@@ -2348,7 +2377,9 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+         {float(request.adapt), &r.meterProgram, &owner->meterAttempted, nullptr, meterShader, viewMeterFailed,
+          "eye adaptation meter"},
+         {float(aoMode || ssrMode), &r.distanceProgram, &owner->distanceAttempted, nullptr, distanceShader,
+-         viewDistanceFailed, "half-resolution distances"}};
++         viewDistanceFailed, "half-resolution distances"},
++        {float(finishMode && request.wounds.count), &r.woundProgram, &owner->woundAttempted, nullptr, woundShader,
++         viewWoundsFailed, "wound marks"}};
+     for (unsigned i = 0; i < programCount; ++i) {
+         if (!effects[i].mode || *effects[i].attempted) continue;
+         *effects[i].attempted = true;
+@@ -2761,6 +2792,58 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+             }
+         }
+         stampTo(4);
++        // Wound marks first, on the image the finishing pass reads, only inside their screen box.
++        if (finishMode && request.wounds.count && r.woundProgram && g.uniform4fv && projection.worldUpValid &&
++            (source == r.viewColor || source == r.chainTex) && woundPassReady(g, r)) {
++            const WoundUniforms& wounds = request.wounds;
++        // The screen box of every wound's reach (centre +- half length + runs + 6 cm, as the shader
++        // tests); a wound the camera stands within covers the whole view.
++        float box[4] = {1.f, 1.f, 0.f, 0.f};
++        for (unsigned k = 0; k < wounds.count; ++k) {
++            const float* c = wounds.a[k];
++            const float reach = c[3] + wounds.c[k][3] + 6.f, depth = -c[2];
++            if (!(depth - reach > 1.f)) { box[0] = box[1] = 0.f; box[2] = box[3] = 1.f; break; }
++            const float sx = (projection.p0 * c[0] / depth - projection.p8) * 0.5f + 0.5f;
++            const float sy = (projection.p5 * c[1] / depth - projection.p9) * 0.5f + 0.5f;
++            const float rx = std::abs(projection.p0) * reach / (depth - reach) * 0.5f;
++            const float ry = std::abs(projection.p5) * reach / (depth - reach) * 0.5f;
++            box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
++            box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
++        }
++        box[0] = std::clamp(box[0], 0.f, 1.f); box[1] = std::clamp(box[1], 0.f, 1.f);
++            box[2] = std::clamp(box[2], 0.f, 1.f); box[3] = std::clamp(box[3], 0.f, 1.f);
++            if (box[2] > box[0] && box[3] > box[1]) {
++                const auto& u = viewUniforms[contextIndex][programWounds];
++                g.activeTexture(glc::texture1);
++                g.bindTexture(GL_TEXTURE_2D, r.viewDepth);
++                g.activeTexture(glc::texture0);
++                g.bindTexture(GL_TEXTURE_2D, source);
++                g.bindFramebuffer(glc::framebuffer, r.woundFbo);
++                g.framebufferTexture2D(glc::framebuffer, glc::colorAttachment0, GL_TEXTURE_2D, source, 0);
++                setViewport(g, 0, 0, viewport[2], viewport[3]);
++                glDisable(GL_BLEND);
++                g.useProgram(r.woundProgram);
++                setViewUniforms(g, u, frame);
++                g.uniform1f(u.at[uWoundCount], float(wounds.count));
++                g.uniform4fv(u.at[uWoundA], GLsizei(wounds.count), &wounds.a[0][0]);
++                g.uniform4fv(u.at[uWoundB], GLsizei(wounds.count), &wounds.b[0][0]);
++                g.uniform4fv(u.at[uWoundC], GLsizei(wounds.count), &wounds.c[0][0]);
++                g.uniform4f(u.at[uWoundRect], box[0], box[1], box[2], box[3]);
++                g.uniform4f(u.at[uWorldUp], projection.worldUpX, projection.worldUpY, projection.worldUpZ, 0.f);
++                // The box as a quad, in the vertex shader's -1..1 position (uv = position * 0.5 + 0.5).
++                const float quad[8] = {box[0] * 2.f - 1.f, box[1] * 2.f - 1.f, box[2] * 2.f - 1.f, box[1] * 2.f - 1.f,
++                                       box[0] * 2.f - 1.f, box[3] * 2.f - 1.f, box[2] * 2.f - 1.f, box[3] * 2.f - 1.f};
++                g.bindVertexArray(r.woundQuadVao);
++                g.bindBuffer(glc::arrayBuffer, r.woundQuadVbo);
++                g.bufferData(glc::arrayBuffer, ptrdiff_t(sizeof quad), quad, glc::dynamicDraw);
++                g.vertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, nullptr);
++                g.enableVertexAttribArray(0);
++                woundTextureBarrier();
++                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++                woundTextureBarrier(); // the finishing pass reads what was just written
++                g.bindVertexArray(r.viewVao);
++            }
++        }
+         if (finishMode) {
+             beginPass(true);
+             g.activeTexture(glc::texture1);
+@@ -2929,29 +3012,6 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+                                  projection.worldUpValid ? projection.worldUpZ : 0.f};
+             g.uniform4f(u.at[uWorldUp], up[0], up[1], up[2], 0.f);
+             if (held) heldDetailFrames.fetch_add(1, std::memory_order_relaxed);
+-            const WoundUniforms& wounds = request.wounds;
+-            const bool woundsOn = wounds.count && g.uniform4fv && projection.worldUpValid;
+-            g.uniform1f(u.at[uWoundCount], woundsOn ? float(wounds.count) : 0.f);
+-            if (woundsOn) {
+-                g.uniform4fv(u.at[uWoundA], GLsizei(wounds.count), &wounds.a[0][0]);
+-                g.uniform4fv(u.at[uWoundB], GLsizei(wounds.count), &wounds.b[0][0]);
+-                g.uniform4fv(u.at[uWoundC], GLsizei(wounds.count), &wounds.c[0][0]);
+-                // The screen box of every wound's reach (centre +- half length + runs + 6 cm, as the shader
+-                // tests); a wound the camera stands within covers the whole view.
+-                float box[4] = {1.f, 1.f, 0.f, 0.f};
+-                for (unsigned k = 0; k < wounds.count; ++k) {
+-                    const float* c = wounds.a[k];
+-                    const float reach = c[3] + wounds.c[k][3] + 6.f, depth = -c[2];
+-                    if (!(depth - reach > 1.f)) { box[0] = box[1] = 0.f; box[2] = box[3] = 1.f; break; }
+-                    const float sx = (projection.p0 * c[0] / depth - projection.p8) * 0.5f + 0.5f;
+-                    const float sy = (projection.p5 * c[1] / depth - projection.p9) * 0.5f + 0.5f;
+-                    const float rx = std::abs(projection.p0) * reach / (depth - reach) * 0.5f;
+-                    const float ry = std::abs(projection.p5) * reach / (depth - reach) * 0.5f;
+-                    box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
+-                    box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
+-                }
+-                g.uniform4f(u.at[uWoundRect], box[0], box[1], box[2], box[3]);
+-            }
+             g.uniform1f(u.at[uExposure], exposure);
+             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+             // Wound skins for the next frame's body draws; the snapshot's restore covers its state.

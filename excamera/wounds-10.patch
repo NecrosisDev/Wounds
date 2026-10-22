@@ -1,0 +1,504 @@
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index c7a42e2..86f33cf 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -70,12 +70,20 @@ struct Wound {
+     bool mapTried = false, mapped = false;
+     bool fracture = false; // a bruise over a bone Injuries reports broken ("injuries.broken")
+     int8_t partIndex = -1; // the struck part's index (+0x468), 0..17
++    uintptr_t actor = 0;   // the character's scene node, once mapped (wounds_bake.inl)
++    float drip = 0.f;      // counts up to the next drop of blood falling from a bleeding cut
+     uint8_t kind = 0;
+ };
+ 
+ // What the finishing pass takes: view-space marks, nearest first.
++constexpr unsigned woundDripLimit = 96, woundDripShown = 24;
++constexpr float woundDripSeconds = 120.f, woundDripDrySeconds = 30.f;
+ struct WoundUniforms {
+     unsigned count = 0;
++    unsigned drips = 0;      // blood drops on the floor, below
++    bool burning = false;    // a character in view is burnt (the skin bake has work)
++    float d[woundDripShown][4]; // a drop: view-space point it fell from; w: radius (cm) + 10 x dryness step (0..9)
++    bool any() const { return count || drips || burning; }
+     float a[woundShownLimit][4]; // centre; w: half length, cm (a bruise's radius)
+     float b[woundShownLimit][4]; // the blade's path, unit; w: kind
+     float c[woundShownLimit][4]; // severity 0..1, seed, half width (cm), blood run length (cm)
+@@ -89,6 +97,20 @@ static std::atomic<CharacterHits> characterHits{nullptr};
+ static std::atomic<ULONGLONG> characterHitsProbed{0};
+ static std::atomic<unsigned> woundsTaken{0}, woundsRetired{0}, woundFaults{0}, woundsMended{0};
+ static unsigned woundSkinVersion = 1; // woundLock: bumped when a baked (mapped) mark changes or goes
++// Injuries' "injuries.burn" mark: a burn level (0..255) per character scene node, read each frame; woundLock.
++struct WoundBurn { uintptr_t actor; uint32_t level; };
++static WoundBurn woundBurns[64];
++static int woundBurnCount = 0;
++static float woundBurnLevel(uintptr_t actor) {
++    for (int b = 0; b < woundBurnCount; ++b)
++        if (woundBurns[b].actor == actor) return float(woundBurns[b].level) / 255.f;
++    return 0.f;
++}
++// Drops of blood fallen from bleeding cuts: where they fell from (the cut, sector-local) and its sector's
++// origin; the wound pass draws each on the first upward surface 20..200 cm below. woundLock.
++struct WoundDrip { float from[3], sectorOrigin[3], radius; ULONGLONG born; };
++static WoundDrip woundDrips[96];
++static unsigned woundDripNext = 0;
+ static bool woundSkinBaked(uintptr_t character);            // wounds_bake.inl
+ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r); // wounds_bake.inl, from the view-effects pass
+ 
+@@ -401,6 +423,27 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         __except (EXCEPTION_EXECUTE_HANDLER) { brokenCount = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
+         brokenCount = std::clamp(brokenCount, 0, int(woundMendLimit));
+     }
++    {
++        uintptr_t burnNodes[64]{};
++        uint32_t burnLevels[64]{};
++        int found = 0;
++        if (const WoundMarkNodes marks = woundMarkExport()) {
++            __try { found = marks("injuries.burn", burnNodes, burnLevels, 64); }
++            __except (EXCEPTION_EXECUTE_HANDLER) { found = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
++            found = std::clamp(found, 0, 64);
++        }
++        bool changed = found != woundBurnCount;
++        for (int b = 0; b < found && !changed; ++b) {
++            const float before = woundBurnLevel(burnNodes[b]) * 255.f;
++            changed = std::abs(before - float(burnLevels[b])) >= 4.f;
++        }
++        if (changed) {
++            for (int b = 0; b < found; ++b) woundBurns[b] = {burnNodes[b], (std::min)(burnLevels[b], 255u)};
++            woundBurnCount = found;
++            ++woundSkinVersion;
++        }
++        out.burning = woundBurnCount > 0;
++    }
+     const float fadeDt = woundFadeTick ? (std::min)(float(now - woundFadeTick) / 1000.f, 0.5f) : 0.f;
+     woundFadeTick = now;
+     for (unsigned i = 0; i < woundLimit; ++i) {
+@@ -468,11 +511,24 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+             const float age = float(now - w.born) / 1000.f;
+             const float flow = (std::max)(std::clamp(bleed / woundBleedFull, 0.f, 1.f), age < woundFreshSeconds ? 0.6f : 0.f);
+             if (flow > 0.02f) w.run = (std::min)(w.run + fadeDt * (0.4f + 1.6f * flow), 4.f + 14.f * w.severity);
++            if (flow > 0.15f) w.drip += fadeDt * flow * 2.f; // up to two drops a second while it pours
+             w.wet = flow >= w.wet ? flow : (std::max)(w.wet - fadeDt / woundDrySeconds, flow);
+         }
+         float world[3], path[3];
+         outOfPose(pose, w.local, true, world);
+         outOfPose(pose, w.along, false, path);
++        if (w.drip >= 1.f) {
++            w.drip -= 1.f;
++            WoundDrip& d = woundDrips[woundDripNext];
++            woundDripNext = (woundDripNext + 1) % woundDripLimit;
++            const unsigned salt = unsigned(now) * 2654435761u + i * 40503u;
++            d.from[0] = world[0] + float(int(salt % 9) - 4);
++            d.from[1] = world[1];
++            d.from[2] = world[2] + float(int((salt >> 8) % 9) - 4);
++            memcpy(d.sectorOrigin, sectorOrigin, sizeof d.sectorOrigin);
++            d.radius = 1.2f + float((salt >> 16) % 25) / 10.f;
++            d.born = now;
++        }
+         Shown s{};
+         s.distanceSq = woundReachCm * woundReachCm;
+         bool found = false;
+@@ -522,5 +578,36 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         memcpy(out.c[k], c, sizeof c);
+     }
+     out.count = count;
++    // The drops, nearest first, as their point in view space (the nearer reading of the sector origin, as
++    // for the wounds); gone after two minutes, dry after half of one.
++    struct ShownDrip { float distanceSq, centre[3], w; };
++    ShownDrip drops[woundDripLimit];
++    unsigned dropCount = 0;
++    for (WoundDrip& d : woundDrips) {
++        if (!d.born) continue;
++        const float age = float(now - d.born) / 1000.f;
++        if (age > woundDripSeconds) { d = {}; continue; }
++        ShownDrip s{woundReachCm * woundReachCm, {}, 0.f};
++        bool found = false;
++        for (int candidate = 0; candidate < 2; ++candidate) {
++            float q[3], c[3];
++            for (int k = 0; k < 3; ++k) q[k] = d.from[k] + (candidate ? d.sectorOrigin[k] : 0.f);
++            for (int k = 0; k < 3; ++k) c[k] = q[0] * view[k] + q[1] * view[4 + k] + q[2] * view[8 + k] + view[12 + k];
++            const float sq = c[0] * c[0] + c[1] * c[1] + c[2] * c[2];
++            if (std::isfinite(sq) && sq < s.distanceSq) { s.distanceSq = sq; memcpy(s.centre, c, sizeof c); found = true; }
++        }
++        if (!found) continue;
++        const float dry = (std::min)(age / woundDripDrySeconds, 1.f);
++        s.w = d.radius + 10.f * std::floor(dry * 9.f);
++        drops[dropCount++] = s;
++    }
++    const unsigned dripCount = (std::min)(dropCount, woundDripShown);
++    std::partial_sort(drops, drops + dripCount, drops + dropCount,
++                      [](const ShownDrip& l, const ShownDrip& r) { return l.distanceSq < r.distanceSq; });
++    for (unsigned k = 0; k < dripCount; ++k) {
++        const float v[4] = {drops[k].centre[0], drops[k].centre[1], drops[k].centre[2], drops[k].w};
++        memcpy(out.d[k], v, sizeof v);
++    }
++    out.drips = dripCount;
+     ReleaseSRWLockExclusive(&woundLock);
+ }
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 9b0026a..9d88f4d 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -1143,6 +1143,8 @@ uniform vec4 woundC[12];   // severity 0..1, seed (negative: the skin part is ba
+                            // length of the blood runs (cm)
+ uniform float woundCount;
+ uniform vec4 woundRect;    // screen box (uv min xy, max zw) that holds every wound's reach; outside it nothing to do
++uniform vec4 dripA[24];    // a drop of blood: view-space point it fell from; w: radius (cm) + 10 x dryness step (0..9)
++uniform float dripCount;
+ 
+ float woundHash(float x) {
+     return fract(sin(x * 12.9898) * 43758.5453);
+@@ -1270,6 +1272,34 @@ vec3 woundMarks(vec3 color) {
+         tint *= mix(vec3(1.0), cut, stick);
+         wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux) * (1.0 - 0.6 * cloth);
+     }
++    // Drops of blood on the first upward surface 20..200 cm below where they fell from: a round drop
++    // with a ragged rim and a few specks, bright and wet at first, dark brown once dry.
++    for (int j = 0; j < 24; ++j) {
++        if (float(j) >= dripCount) break;
++        vec4 D = dripA[j];
++        float dryStep = floor(D.w / 10.0), radius = D.w - 10.0 * dryStep, dry = dryStep / 9.0;
++        vec3 d = p - D.xyz;
++        float h = dot(d, worldUp.xyz);
++        if (h > -20.0 || h < -200.0) continue;
++        vec3 spread = d - worldUp.xyz * h;
++        float r = length(spread);
++        if (r > radius * 3.0) continue;
++        if (!near) {
++            n = viewNormal(uv, p);
++            near = true;
++            vec3 base = toLight(color);
++            float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
++            grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
++        }
++        if (dot(n, worldUp.xyz) < 0.6) continue;
++        float rim = 0.85 + 0.3 * woundHash(floor(atan(spread.z, spread.x) * 3.0) + D.x * 0.37);
++        float drop = 1.0 - smoothstep(0.8, 1.0, r / (radius * rim));
++        vec2 cell = floor(vec2(dot(spread, normalize(cross(worldUp.xyz, vec3(0.0, 0.0, 1.0)))), r) * 0.9);
++        float speck = step(0.93, woundHash(cell.x * 17.0 + cell.y * 59.0 + D.y * 0.71)) * (1.0 - smoothstep(radius, radius * 3.0, r));
++        float m = max(drop, speck * 0.8);
++        tint *= mix(vec3(1.0), mix(vec3(0.33, 0.025, 0.02), vec3(0.28, 0.1, 0.06), dry), m);
++        wet += m * (1.0 - dry) * 0.8;
++    }
+     if (!near) return color;
+     vec3 lit = toLight(color);
+     float level = dot(lit, vec3(0.2126, 0.7152, 0.0722));
+@@ -1297,7 +1327,7 @@ enum ViewUniform : unsigned {
+     uAoHalf, uSsrHalf, uHalfSize, uAoStrength, uSsrOn, uBounceOn, uBounceStrength, uSharpen, uPreviousDepth, uSurfacesOn, uSsrSize, uDofOn, uDistanceHalf, uDistanceHalfOn,
+     uFrameOffset, uCurrent, uHistory, uToPrevious, uPreviousProjection, uHistoryWeight, uDofHalf, uCells, uExposure,
+     uSilhouette, uSilhouetteOn, uHeldDetail, uHeldNoise, uHeldData, uLevelDetail, uLevelRow0, uLevelRow1, uLevelRow2, uLevelPeople,
+-    uWoundA, uWoundB, uWoundC, uWoundCount, uWoundRect, viewUniformCount
++    uWoundA, uWoundB, uWoundC, uWoundCount, uWoundRect, uDripA, uDripCount, viewUniformCount
+ };
+ static const char* const viewUniformNames[viewUniformCount] = {
+     "sceneTex", "depthTex", "texel", "projection", "depthLinear", "pixelScale", "encoded",
+@@ -1305,7 +1335,7 @@ static const char* const viewUniformNames[viewUniformCount] = {
+     "aoHalf", "ssrHalf", "halfSize", "aoStrength", "ssrOn", "bounceOn", "bounceStrength", "sharpen", "previousDepth", "surfacesOn", "ssrSize", "dofOn", "distanceHalf", "distanceHalfOn",
+     "frameOffset", "current", "history", "toPrevious", "previousProjection", "historyWeight", "dofHalf", "cells", "exposure",
+     "silhouette", "silhouetteOn", "heldDetail", "heldNoise", "heldData", "levelDetail", "levelRow0", "levelRow1", "levelRow2", "levelPeople",
+-    "woundA", "woundB", "woundC", "woundCount", "woundRect"};
++    "woundA", "woundB", "woundC", "woundCount", "woundRect", "dripA", "dripCount"};
+ struct ViewProgramUniforms { GLint at[viewUniformCount]; };
+ enum ViewProgram : unsigned {
+     programAo, programSsr, programDof, programFinish, programComposite, programResolve, programDofComposite,
+@@ -2085,7 +2115,7 @@ struct ViewRequest {
+     WoundUniforms wounds;                // wounds in view, already in this view's space
+     bool finish() const {
+         return smooth > 0.f || sharpen > 0.f || visor > 0.f || ghost || detail > 0.f || level > 0.f || hurt > 0.f || winded > 0.f ||
+-               wounds.count;
++               wounds.any();
+     }
+     bool any() const { return ao > 0.f || dof > 0.f || ssr > 0.f || adapt || finish(); }
+ };
+@@ -2381,7 +2411,7 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+          "eye adaptation meter"},
+         {float(aoMode || ssrMode), &r.distanceProgram, &owner->distanceAttempted, nullptr, distanceShader,
+          viewDistanceFailed, "half-resolution distances"},
+-        {float(finishMode && request.wounds.count), &r.woundProgram, &owner->woundAttempted, nullptr, woundShader,
++        {float(finishMode && (request.wounds.count || request.wounds.drips)), &r.woundProgram, &owner->woundAttempted, nullptr, woundShader,
+          viewWoundsFailed, "wound marks"}};
+     for (unsigned i = 0; i < programCount; ++i) {
+         if (!effects[i].mode || *effects[i].attempted) continue;
+@@ -2796,7 +2826,7 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+         }
+         stampTo(4);
+         // Wound marks first, on the image the finishing pass reads, only inside their screen box.
+-        if (finishMode && request.wounds.count && r.woundProgram && g.uniform4fv && projection.worldUpValid &&
++        if (finishMode && (request.wounds.count || request.wounds.drips) && r.woundProgram && g.uniform4fv && projection.worldUpValid &&
+             (source == r.viewColor || source == r.chainTex) && woundPassReady(g, r)) {
+             const WoundUniforms& wounds = request.wounds;
+         // The screen box of every wound's reach (centre +- half length + runs + 6 cm, as the shader
+@@ -2813,6 +2843,21 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+             box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
+             box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
+         }
++        // Each drop's reach: from 20 to 200 cm below where it fell, three radii across.
++        for (unsigned k = 0; k < wounds.drips && box[2] - box[0] < 1.f; ++k) {
++            const float* d = wounds.d[k];
++            const float radius = d[3] - 10.f * std::floor(d[3] / 10.f);
++            const float c[3] = {d[0] - projection.worldUpX * 110.f, d[1] - projection.worldUpY * 110.f,
++                                d[2] - projection.worldUpZ * 110.f};
++            const float reach = 90.f + radius * 3.f, depth = -c[2];
++            if (!(depth - reach > 1.f)) { box[0] = box[1] = 0.f; box[2] = box[3] = 1.f; break; }
++            const float sx = (projection.p0 * c[0] / depth - projection.p8) * 0.5f + 0.5f;
++            const float sy = (projection.p5 * c[1] / depth - projection.p9) * 0.5f + 0.5f;
++            const float rx = std::abs(projection.p0) * reach / (depth - reach) * 0.5f;
++            const float ry = std::abs(projection.p5) * reach / (depth - reach) * 0.5f;
++            box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
++            box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
++        }
+         box[0] = std::clamp(box[0], 0.f, 1.f); box[1] = std::clamp(box[1], 0.f, 1.f);
+             box[2] = std::clamp(box[2], 0.f, 1.f); box[3] = std::clamp(box[3], 0.f, 1.f);
+             if (box[2] > box[0] && box[3] > box[1]) {
+@@ -2832,6 +2877,8 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+                 g.uniform4fv(u.at[uWoundB], GLsizei(wounds.count), &wounds.b[0][0]);
+                 g.uniform4fv(u.at[uWoundC], GLsizei(wounds.count), &wounds.c[0][0]);
+                 g.uniform4f(u.at[uWoundRect], box[0], box[1], box[2], box[3]);
++                g.uniform1f(u.at[uDripCount], float(wounds.drips));
++                if (wounds.drips) g.uniform4fv(u.at[uDripA], GLsizei(wounds.drips), &wounds.d[0][0]);
+                 g.uniform4f(u.at[uWorldUp], projection.worldUpX, projection.worldUpY, projection.worldUpZ, 0.f);
+                 // The box as a quad, in the vertex shader's -1..1 position (uv = position * 0.5 + 0.5).
+                 const float quad[8] = {box[0] * 2.f - 1.f, box[1] * 2.f - 1.f, box[2] * 2.f - 1.f, box[1] * 2.f - 1.f,
+@@ -3018,7 +3065,7 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+             g.uniform1f(u.at[uExposure], exposure);
+             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+             // Wound skins for the next frame's body draws; the snapshot's restore covers its state.
+-            if (request.wounds.count) bakeWoundSkins(g, r);
++            if (request.wounds.any()) bakeWoundSkins(g, r);
+         }
+         stampTo(5);
+         ok = !audit || glGetError() == GL_NO_ERROR; // errors are looked for on audit frames
+diff --git src/mod/wounds_bake.inl src/mod/wounds_bake.inl
+index 795310c..42e0890 100644
+--- src/mod/wounds_bake.inl
++++ src/mod/wounds_bake.inl
+@@ -8,7 +8,9 @@
+ // body in first person takes both copies through the headwear path's swap (stone_skin.inl). Stage 3: wet
+ // gloss goes into a copy of the spec map (unit 1: the skin shading reads R as specular strength, G as
+ // gloss, B as metal, shading.flb shadesss_f), fresh blood glossy and dried blood dull; a fracture (R.w 1)
+-// draws as a wider, darker bruise and swells more.
++// draws as a wider, darker bruise and swells more. Stage 4: burns, from Injuries' "injuries.burn" mark
++// (a level per character), over the whole skin: reddened first, then blistered, then charred black in
++// patches; a burnt character without cuts gets a slot too.
+ //
+ // 1. Mapping, once per wound: the hit, kept in its body part's frame, is carried into the frame of
+ //    the bone of the character's _SKIN mesh that is that part's scene node; the nearest body face
+@@ -223,6 +225,7 @@ static void woundSkinMap(Wound& w) {
+         const float det = w.uvAlong[0] * w.uvAcross[1] - w.uvAlong[1] * w.uvAcross[0];
+         if (!(std::fabs(det) > 1e-12f) || !std::isfinite(w.uv[0] + w.uv[1])) continue;
+         w.skinNode = node;
++        w.actor = actor;
+         w.mapped = true;
+         return;
+     }
+@@ -256,7 +259,31 @@ void main() {
+     gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+ }
+ )glsl";
+-static const char* const woundSkinFragment = R"glsl(#version 130
++// Shared by the three fragment programs: the version, a hash and the burn pattern (value noise in UV
++// space; seams in the UV layout show as seams in the pattern).
++static const char* const woundSkinFragmentHead = R"glsl(#version 130
++uniform float burnLevel; // 0..1: the character's burn
++uniform float burnSeed;
++float markHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }
++float burnNoise(vec2 p) {
++    vec2 i = floor(p), f = fract(p);
++    f = f * f * (3.0 - 2.0 * f);
++    float a = markHash(i.x + i.y * 57.0), b = markHash(i.x + 1.0 + i.y * 57.0);
++    float c = markHash(i.x + (i.y + 1.0) * 57.0), d = markHash(i.x + 1.0 + (i.y + 1.0) * 57.0);
++    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
++}
++// x: reddened, y: blistered, z: charred, w: ash speckle, each 0..1 at this texel.
++vec4 burnAt(vec2 t) {
++    vec2 o = vec2(burnSeed * 13.1, burnSeed * 7.7);
++    float f = 0.55 * burnNoise(t * 18.0 + o) + 0.3 * burnNoise(t * 41.0 + o) + 0.15 * burnNoise(t * 97.0 + o);
++    float red = smoothstep(f - 0.15, f + 0.15, burnLevel * 1.6);
++    float blister = smoothstep(0.3, 0.6, burnLevel) * smoothstep(0.75, 0.85, burnNoise(t * 170.0 + o)) * red;
++    float charred = smoothstep(f - 0.08, f + 0.08, (burnLevel - 0.5) * 1.8);
++    return vec4(red, blister * (1.0 - charred), charred, step(0.85, burnNoise(t * 260.0 + o)));
++}
++)glsl";
++
++static const char* const woundSkinFragment = R"glsl(
+ uniform sampler2D baseTex;
+ uniform vec4 markP[16]; // UV centre; zw: first row of UV offset -> (cm along the blade, cm across)
+ uniform vec4 markQ[16]; // xy: second row; z: half length (a bruise's radius), w: half width, cm
+@@ -264,10 +291,15 @@ uniform vec4 markR[16]; // x: kind + 0.98 x age; y: severity; z: seed; w: unused
+ uniform float markCount;
+ in vec2 texUv;
+ out vec4 fragColor;
+-float markHash(float x) { return fract(sin(x * 12.9898) * 43758.5453); }
+ void main() {
+     vec4 base = textureLod(baseTex, texUv, 0.0);
+     vec3 tint = vec3(1.0);
++    if (burnLevel > 0.0) {
++        vec4 b = burnAt(texUv);
++        tint = mix(vec3(1.0), vec3(1.0, 0.62, 0.52), b.x * 0.8);
++        tint = mix(tint, vec3(1.15, 1.02, 0.82), b.y * 0.7);
++        tint = mix(tint, mix(vec3(0.1, 0.07, 0.05), vec3(0.35, 0.33, 0.3), b.w), b.z);
++    }
+     for (int i = 0; i < 16; ++i) {
+         if (float(i) >= markCount) break;
+         vec4 P = markP[i], Q = markQ[i], R = markR[i];
+@@ -309,7 +341,7 @@ void main() {
+ // game's skin shading reads it (shading.flb shadesss_f: xy * 2 - 1, x along the vertex tangent, y along
+ // normal x tangent times its sign; taken here as +u and +v, inferred). Screen derivatives of the UV-space
+ // render are per texel; each slope is scaled by the cm per UV of the mark nearest the texel.
+-static const char* const woundSkinNormalFragment = R"glsl(#version 130
++static const char* const woundSkinNormalFragment = R"glsl(
+ uniform sampler2D baseTex;
+ uniform vec4 markP[16];
+ uniform vec4 markQ[16];
+@@ -348,13 +380,19 @@ void main() {
+         }
+     }
+     vec2 slope = vec2(dFdx(h) * texSize.x, dFdy(h) * texSize.y) / max(cmPerUv, vec2(1e-4));
++    if (burnLevel > 0.0) {
++        // Blisters rise; charred skin cracks. About 150 cm of body to the texture's width.
++        vec4 b = burnAt(texUv);
++        float hb = 0.12 * b.y - 0.05 * b.z * step(0.6, burnNoise(texUv * 120.0));
++        slope += vec2(dFdx(hb) * texSize.x, dFdy(hb) * texSize.y) / 150.0;
++    }
+     vec2 n = clamp(base.xy * 2.0 - 1.0 - slope, vec2(-0.95), vec2(0.95));
+     fragColor = vec4(n * 0.5 + 0.5, base.z, base.w);
+ }
+ )glsl";
+ 
+ // The spec map's copy: fresh blood (the gash, the smear) glossy and strong, dried blood dull, never metal.
+-static const char* const woundSkinSpecFragment = R"glsl(#version 130
++static const char* const woundSkinSpecFragment = R"glsl(
+ uniform sampler2D baseTex;
+ uniform vec4 markP[16];
+ uniform vec4 markQ[16];
+@@ -382,7 +420,13 @@ void main() {
+         if (cover > blood) { blood = cover; wet = aux; }
+     }
+     vec3 spec = vec3(mix(0.12, 0.75, wet), mix(0.25, 0.9, wet), 0.0); // strength, gloss, metal
+-    fragColor = vec4(mix(base.rgb, spec, blood), base.a);
++    vec3 skin = base.rgb;
++    if (burnLevel > 0.0) {
++        vec4 b = burnAt(texUv);
++        skin = mix(skin, vec3(0.5, 0.8, 0.0), b.y);   // blisters: wet and glossy
++        skin = mix(skin, vec3(0.03, 0.08, 0.0), b.z); // char: dull
++    }
++    fragColor = vec4(mix(skin, spec, blood), base.a);
+ }
+ )glsl";
+ 
+@@ -390,7 +434,9 @@ static GLuint woundSkinProgram(gl::Api& g, const char* fragmentText) {
+     auto compile = [&](GLenum type, const char* text) -> GLuint {
+         const GLuint shader = g.createShader(type);
+         if (!shader) return 0;
+-        g.shaderSource(shader, 1, &text, nullptr);
++        const char* parts[2] = {woundSkinFragmentHead, text};
++        if (type == glc::vertexShader) g.shaderSource(shader, 1, &text, nullptr);
++        else g.shaderSource(shader, 2, parts, nullptr);
+         g.compileShader(shader);
+         GLint ok = 0;
+         g.getShaderiv(shader, glc::compileStatus, &ok);
+@@ -443,25 +489,29 @@ static bool woundSkinTexture(const WoundSkinGl& s, WoundSkinMap& map, unsigned&
+ }
+ 
+ // The slots follow the characters with mapped marks nearest in the store's order; woundLock held.
++// The slots follow the characters (by scene node) with mapped marks or a burn; woundLock held.
+ static void woundSkinAssign() {
+     bool wanted[woundSkinLimit]{};
+-    for (const Wound& w : woundStore) {
+-        if (!w.part || !w.mapped) continue;
++    auto claim = [&](uintptr_t actor, uintptr_t character) {
++        if (!actor) return;
+         unsigned k = 0;
+-        while (k < woundSkinLimit && woundSkinSlots[k].character != w.owner) ++k;
++        while (k < woundSkinLimit && woundSkinSlots[k].actor != actor) ++k;
+         if (k == woundSkinLimit) {
+             k = 0;
+-            while (k < woundSkinLimit && woundSkinSlots[k].character) ++k;
+-            if (k == woundSkinLimit) continue;
++            while (k < woundSkinLimit && woundSkinSlots[k].actor) ++k;
++            if (k == woundSkinLimit) return;
+             woundSkinSlots[k] = {};
+-            woundSkinSlots[k].character = w.owner;
+-            __try { woundSkinSlots[k].actor = *(const uintptr_t*)(w.owner + field::character::sceneNode); }
+-            __except (EXCEPTION_EXECUTE_HANDLER) { woundSkinSlots[k] = {}; continue; }
++            woundSkinSlots[k].actor = actor;
+         }
++        if (character) woundSkinSlots[k].character = character;
+         wanted[k] = true;
+-    }
++    };
++    for (const Wound& w : woundStore)
++        if (w.part && w.mapped) claim(w.actor, w.owner);
++    for (int b = 0; b < woundBurnCount; ++b)
++        if (woundBurns[b].level) claim(woundBurns[b].actor, 0);
+     for (unsigned k = 0; k < woundSkinLimit; ++k)
+-        if (!wanted[k] && woundSkinSlots[k].character) woundSkinSlots[k] = {}; // its texture is kept for the next one
++        if (!wanted[k] && woundSkinSlots[k].actor) woundSkinSlots[k] = {}; // its texture is kept for the next one
+ }
+ 
+ // Called by the view-effects pass inside its state snapshot (it restores framebuffer, viewport,
+@@ -494,16 +544,17 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+         unsigned baked = 0;
+         for (unsigned k = 0; k < woundSkinLimit && baked < 2; ++k) {
+             WoundSkinSlot& slot = woundSkinSlots[k];
+-            if (!slot.character || !slot.diffuse.source || slot.diffuse.failed) continue;
++            if (!slot.actor || !slot.diffuse.source || slot.diffuse.failed) continue;
++            const float burn = woundBurnLevel(slot.actor);
+             // Marks change (a new one, a mend) or age (bruises darken, mends close): re-bake then, at most every 2 s.
+             const bool changed = slot.bakedVersion != woundSkinVersion;
+             const bool aging = slot.ready && now - slot.bakedAt >= 2000;
+             if (slot.ready && !changed && !aging) continue;
+-            float P[woundSkinMarks][4], Q[woundSkinMarks][4], R[woundSkinMarks][4], corners[woundSkinMarks * 6][2];
++            float P[woundSkinMarks][4], Q[woundSkinMarks][4], R[woundSkinMarks][4], corners[woundSkinMarks * 6 + 6][2];
+             unsigned count = 0;
+             bool ages = false;
+             for (const Wound& w : woundStore) {
+-                if (!w.part || !w.mapped || w.owner != slot.character || count == woundSkinMarks) continue;
++                if (!w.part || !w.mapped || !slot.character || w.owner != slot.character || count == woundSkinMarks) continue;
+                 const float det = w.uvAlong[0] * w.uvAcross[1] - w.uvAlong[1] * w.uvAcross[0];
+                 const float age = float(now - w.born) / 1000.f;
+                 const float aux = w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
+@@ -528,7 +579,14 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 for (int v = 0; v < 6; ++v) memcpy(corners[count * 6 + v], c[order[v]], 8);
+                 ++count;
+             }
+-            if (!count) continue;
++            if (!count && burn <= 0.f) continue;
++            // A burn covers the whole skin: one more quad over all of UV space.
++            unsigned vertices = count * 6;
++            if (burn > 0.f) {
++                const float all[6][2] = {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}, {0.f, 1.f}, {1.f, 0.f}, {1.f, 1.f}};
++                memcpy(corners[vertices], all, sizeof all);
++                vertices += 6;
++            }
+             // Each map: the original into the copy, then the marks over it in UV space, then mipmaps.
+             auto bakeMap = [&](WoundSkinMap& map, unsigned& copy, GLuint program, bool known) -> bool {
+                 if (!program || !map.source || map.failed || !woundSkinTexture(s, map, copy)) return false;
+@@ -552,15 +610,17 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 g.uniform1i(g.getUniformLocation(program, "baseTex"), 0);
+                 g.uniform1f(g.getUniformLocation(program, "markCount"), float(count));
+                 g.uniform2f(g.getUniformLocation(program, "texSize"), float(map.width), float(map.height));
++                g.uniform1f(g.getUniformLocation(program, "burnLevel"), burn);
++                g.uniform1f(g.getUniformLocation(program, "burnSeed"), float(slot.actor % 997) / 997.f);
+                 g.uniform4fv(g.getUniformLocation(program, "markP"), GLsizei(count), &P[0][0]);
+                 g.uniform4fv(g.getUniformLocation(program, "markQ"), GLsizei(count), &Q[0][0]);
+                 g.uniform4fv(g.getUniformLocation(program, "markR"), GLsizei(count), &R[0][0]);
+                 g.bindVertexArray(r.woundBakeVao);
+                 g.bindBuffer(glc::arrayBuffer, r.woundBakeVbo);
+-                g.bufferData(glc::arrayBuffer, ptrdiff_t(count * 6 * 8), corners, glc::dynamicDraw);
++                g.bufferData(glc::arrayBuffer, ptrdiff_t(vertices * 8), corners, glc::dynamicDraw);
+                 g.vertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, nullptr);
+                 g.enableVertexAttribArray(0);
+-                glDrawArrays(GL_TRIANGLES, 0, GLsizei(count * 6));
++                glDrawArrays(GL_TRIANGLES, 0, GLsizei(vertices));
+                 s.mipmap(copy);
+                 return true;
+             };
+@@ -584,7 +644,7 @@ static int woundSkinSlotOf(uintptr_t node) {
+     if (!readable(node, 0x2a0) || strncmp(nodeName(node), "_SKIN", 5)) return -1;
+     const uintptr_t parent = *(uintptr_t*)(node + field::sceneNode::parent);
+     for (unsigned k = 0; k < woundSkinLimit; ++k)
+-        if (woundSkinSlots[k].character && woundSkinSlots[k].actor == parent) return int(k);
++        if (woundSkinSlots[k].actor && woundSkinSlots[k].actor == parent) return int(k);
+     return -1;
+ }
+ 

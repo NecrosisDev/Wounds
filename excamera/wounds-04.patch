@@ -1,0 +1,118 @@
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 188bb30..88c5d34 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -511,7 +511,8 @@ uniform sampler2D heldData;
+ uniform sampler3D heldNoise; // tiling smooth noise, 16 units a tile (held-item surfaces)
+ uniform vec4 worldUp;      // world +Y in view space; w unused
+ uniform vec4 woundA[12];   // a wound's view-space centre; w: half length, cm (a bruise's radius)
+-uniform vec4 woundB[12];   // the blade's path, view space; w: 1 cut, 2 crush, 3 thrust
++uniform vec4 woundB[12];   // the blade's path, view space; w: kind (1 cut, 2 crush, 3 thrust) + 0.98 x a cut's
++                           // wetness or a bruise's age, 0..1
+ uniform vec4 woundC[12];   // severity 0..1, seed, half width (cm), length of the blood runs (cm)
+ uniform float woundCount;
+ 
+@@ -548,12 +549,16 @@ vec3 woundMarks(vec3 color) {
+         vec3 s = cross(n, t);
+         vec2 q = vec2(dot(d, t), dot(d, s)); // cm along the blade's path and across it, on the surface
+         float severity = C.x, seed = C.y;
+-        if (B.w > 1.5 && B.w < 2.5) {
++        float kind = floor(B.w + 0.01), aux = clamp((B.w - kind) / 0.98, 0.0, 1.0);
++        if (kind == 2.0) {
+             // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
+             float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
+             float r = length(q) / (A.w * mottle);
+             float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick;
+-            vec3 bruise = mix(vec3(0.62, 0.45, 0.62), vec3(0.42, 0.17, 0.2), 1.0 - smoothstep(0.0, 0.7, r));
++            // Fresh it is an angry red swelling; over the next minute and a half it darkens to purple.
++            vec3 outer = mix(vec3(0.85, 0.42, 0.4), vec3(0.62, 0.45, 0.62), aux);
++            vec3 inner = mix(vec3(0.6, 0.18, 0.16), vec3(0.42, 0.17, 0.2), aux);
++            vec3 bruise = mix(outer, inner, 1.0 - smoothstep(0.0, 0.7, r));
+             float graze = severity > 0.6 ? step(0.8, woundHash(floor(q.x * 2.0) + floor(q.y * 2.0) * 57.0 + seed * 101.0)) *
+                                                (1.0 - smoothstep(0.0, 0.45, r)) : 0.0;
+             tint *= mix(vec3(1.0), mix(bruise, vec3(0.35, 0.05, 0.04), graze), w);
+@@ -570,7 +575,9 @@ vec3 woundMarks(vec3 color) {
+         float smear = (1.0 - smoothstep(1.2, 4.0, x)) * (1.0 - smoothstep(0.8, 1.25, abs(a))) *
+                       (0.6 + 0.4 * woundHash(floor(q.x * 1.5 + seed * 13.0) + floor(q.y * 1.5) * 31.0));
+         float facing = dot(worldUp.xyz, s) * sign(q.y - wobble); // the lip facing up catches the light
+-        vec3 cut = mix(vec3(1.0), vec3(0.7, 0.22, 0.2), smear * (0.55 + 0.35 * severity));
++        // Wet blood is bright red; dried blood goes dark brown.
++        vec3 blood = mix(vec3(0.3, 0.08, 0.05), vec3(0.32, 0.02, 0.018), aux);
++        vec3 cut = mix(vec3(1.0), mix(vec3(0.55, 0.3, 0.24), vec3(0.7, 0.22, 0.2), aux), smear * (0.55 + 0.35 * severity));
+         cut = mix(cut, vec3(1.0, 0.5, 0.45) * (1.0 + 0.3 * facing), lip * 0.8);
+         cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
+         float run = 0.0;
+@@ -593,10 +600,10 @@ vec3 woundMarks(vec3 color) {
+                 float line = 1.0 - smoothstep(thick * bead * 0.5, thick * bead, abs(across - at - 0.3 * sin(below * 0.4 + fk)));
+                 run = max(run, line * step(0.0, along) * (1.0 - smoothstep(len * 0.85, len, along)));
+             }
+-            cut = mix(cut, vec3(0.32, 0.02, 0.018), run * 0.9);
++            cut = mix(cut, blood, run * 0.9);
+         }
+         tint *= mix(vec3(1.0), cut, stick);
+-        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick;
++        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux);
+     }
+     if (!near) return color;
+     vec3 lit = toLight(color);
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index f864a59..fa49c2f 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -31,6 +31,10 @@ constexpr unsigned woundLimit = 96, woundsPerPart = 4;
+ constexpr unsigned woundShownLimit = 12; // the finishing program's arrays
+ constexpr float woundReachCm = 3000.f, woundMergeCm = 2.5f;
+ enum WoundKind : uint8_t { woundCut = 1, woundCrush = 2, woundThrust = 3 };
++// The character's bleeding rate (0..20): 0x168410 raises it from the wound inflow (+0x10D4) and, above
++// 1, drains health and balance with it; it falls by 0.1 a tick once the inflow stops.
++constexpr size_t woundCharacterBleed = 0x10DC;
++constexpr float woundBleedFull = 6.f, woundFreshSeconds = 10.f, woundDrySeconds = 60.f, woundBruiseSeconds = 90.f;
+ // A struck body part's character, where the game's weapon impact (0x159A60) reads its victim; that impact
+ // hands the same pointer to the damage applier, so it equals the record's victim.
+ constexpr size_t woundPartCharacter = 0x420;
+@@ -41,6 +45,8 @@ struct Wound {
+     float halfLength = 0.f, halfWidth = 0.f, severity = 0.f, seed = 0.f;
+     ULONGLONG born = 0;
+     float fade = 1.f; // 1 as struck; closes towards 0 while the character is marked injuries.mend
++    float run = 0.f;  // length of the blood runs below a cut (cm); grows while the character bleeds
++    float wet = 1.f;  // 1 fresh blood, falls to 0 (dried) about a minute after the bleeding stops
+     uint8_t kind = 0;
+ };
+ 
+@@ -396,6 +402,18 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+                 continue;
+             }
+         }
++        if (w.kind != woundCrush && fadeDt > 0.f) {
++            // Blood runs while the game says this character bleeds (and for the first seconds after any
++            // cut), then dries.
++            float bleed = 0.f;
++            __try { bleed = *(const float*)(owner + woundCharacterBleed); }
++            __except (EXCEPTION_EXECUTE_HANDLER) { bleed = 0.f; }
++            if (!std::isfinite(bleed)) bleed = 0.f;
++            const float age = float(now - w.born) / 1000.f;
++            const float flow = (std::max)(std::clamp(bleed / woundBleedFull, 0.f, 1.f), age < woundFreshSeconds ? 0.6f : 0.f);
++            if (flow > 0.02f) w.run = (std::min)(w.run + fadeDt * (0.4f + 1.6f * flow), 4.f + 14.f * w.severity);
++            w.wet = flow >= w.wet ? flow : (std::max)(w.wet - fadeDt / woundDrySeconds, flow);
++        }
+         float world[3], path[3];
+         outOfPose(pose, w.local, true, world);
+         outOfPose(pose, w.along, false, path);
+@@ -432,13 +450,13 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+     for (unsigned k = 0; k < count; ++k) {
+         const Shown& s = shown[k];
+         const Wound& w = woundStore[s.index];
+-        // Fresh cuts bleed: the runs lengthen over the first half minute.
++        // Kind in the whole part of b[3]; its fraction carries a cut's wetness or a bruise's age, 0..1.
+         const float age = float(now - w.born) / 1000.f;
+-        const float run = w.kind == woundCrush ? 0.f : (std::min)(age / 30.f, 1.f) * (4.f + 14.f * w.severity);
++        const float aux = w.kind == woundCrush ? (std::min)(age / woundBruiseSeconds, 1.f) : std::clamp(w.wet, 0.f, 1.f);
+         // A closing wound shrinks towards its middle and pales.
+         const float a[4] = {s.centre[0], s.centre[1], s.centre[2], w.halfLength * w.fade};
+-        const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind)};
+-        const float c[4] = {w.severity * w.fade, w.seed, w.halfWidth * w.fade, run * w.fade};
++        const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind) + 0.98f * aux};
++        const float c[4] = {w.severity * w.fade, w.seed, w.halfWidth * w.fade, w.run * w.fade};
+         memcpy(out.a[k], a, sizeof a);
+         memcpy(out.b[k], b, sizeof b);
+         memcpy(out.c[k], c, sizeof c);

@@ -1,0 +1,478 @@
+diff --git src/cue_resources.h src/cue_resources.h
+index 7e7ec02..9590fd8 100644
+--- src/cue_resources.h
++++ src/cue_resources.h
+@@ -17,18 +17,21 @@ struct CueResources {
+     // Wound skins (mod/wounds_bake.inl): per-character copies of the body diffuse with the wounds
+     // baked in, and the bake's program, vertex array, buffer and framebuffer. Their own liveness.
+     static constexpr unsigned woundSkinLimit = 6;
+-    unsigned woundSkinTex[woundSkinLimit]{};
+-    unsigned woundBakeProgram = 0, woundBakeVao = 0, woundBakeVbo = 0, woundBakeFbo = 0;
++    unsigned woundSkinTex[woundSkinLimit]{}, woundSkinNrm[woundSkinLimit]{};
++    unsigned woundBakeProgram = 0, woundBakeNormalProgram = 0, woundBakeVao = 0, woundBakeVbo = 0, woundBakeFbo = 0;
+     bool woundLive() const {
+-        for (unsigned t : woundSkinTex)
+-            if (t) return true;
+-        return woundBakeProgram || woundBakeVao || woundBakeVbo || woundBakeFbo;
++        for (unsigned k = 0; k < woundSkinLimit; ++k)
++            if (woundSkinTex[k] || woundSkinNrm[k]) return true;
++        return woundBakeProgram || woundBakeNormalProgram || woundBakeVao || woundBakeVbo || woundBakeFbo;
+     }
+     template <class Api> void retireWound(Api& g) {
+-        for (unsigned& t : woundSkinTex) {
+-            if (t) g.deleteTextures(1, &t);
+-            t = 0;
++        for (unsigned k = 0; k < woundSkinLimit; ++k) {
++            if (woundSkinTex[k]) g.deleteTextures(1, &woundSkinTex[k]);
++            if (woundSkinNrm[k]) g.deleteTextures(1, &woundSkinNrm[k]);
++            woundSkinTex[k] = woundSkinNrm[k] = 0;
+         }
++        if (woundBakeNormalProgram) g.deleteProgram(woundBakeNormalProgram);
++        woundBakeNormalProgram = 0;
+         if (woundBakeProgram) g.deleteProgram(woundBakeProgram);
+         if (woundBakeVao) g.deleteVertexArrays(1, &woundBakeVao);
+         if (woundBakeVbo) g.deleteBuffers(1, &woundBakeVbo);
+diff --git src/mod/stone_skin.inl src/mod/stone_skin.inl
+index eaeb31b..0761121 100644
+--- src/mod/stone_skin.inl
++++ src/mod/stone_skin.inl
+@@ -242,11 +242,19 @@ static bool stoneSkinDraw(uintptr_t node, uintptr_t material, bool bind, bool ow
+ 
+ // The headwear path's own draws of the player's skinned mesh: its native body runs take the
+ // stone maps while the player is stone. cueLock is held by the caller; nothing here throws.
++static bool woundSkinWearBegin(uintptr_t node, uintptr_t material, StoneSwap& swap); // wounds_bake.inl
+ static bool stoneSkinWearBegin(uintptr_t node, uintptr_t material, StoneSwap& swap) {
+     swap = {};
++    bool stone = false;
+     __try {
+-        if (!stoneScope.count || !wearScope.colourPass || !readable(node, 0x2a0) || strncmp(nodeName(node), "_SKIN", 5) ||
+-            !stoneSkinActor(*(uintptr_t*)(node + field::sceneNode::parent)) || !stoneSkinOriginals(material, swap.originals)) return false;
++        stone = stoneScope.count && wearScope.colourPass && readable(node, 0x2a0) && !strncmp(nodeName(node), "_SKIN", 5) &&
++                stoneSkinActor(*(uintptr_t*)(node + field::sceneNode::parent));
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        stone = false;
++    }
++    if (!stone) return woundSkinWearBegin(node, material, swap); // a wounded (not stone) player: the baked skin
++    __try {
++        if (!stoneSkinOriginals(material, swap.originals)) return false;
+         StoneGl s{};
+         if (!loadStoneGl(s)) return false;
+         auto* owner = prepareCue();
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index f464638..3ade99f 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -528,6 +528,7 @@ uniform vec4 woundB[12];   // the blade's path, view space; w: kind (1 cut, 2 cr
+ uniform vec4 woundC[12];   // severity 0..1, seed (negative: the skin part is baked into the skin texture), half width (cm),
+                            // length of the blood runs (cm)
+ uniform float woundCount;
++uniform vec4 woundRect;    // screen box (uv min xy, max zw) that holds every wound's reach; outside it nothing to do
+ 
+ float woundHash(float x) {
+     return fract(sin(x * 12.9898) * 43758.5453);
+@@ -536,6 +537,7 @@ float woundHash(float x) {
+ // Wounds (wounds.inl) on the surface where they landed. They multiply the light already there, so a
+ // wound in shadow stays in shadow; only wet blood adds a little shine, scaled by that same light.
+ vec3 woundMarks(vec3 color) {
++    if (uv.x < woundRect.x || uv.y < woundRect.y || uv.x > woundRect.z || uv.y > woundRect.w) return color;
+     float raw = texture2D(depthTex, uv).r;
+     if (raw >= skyDepth) return color;
+     vec3 p = viewPosition(uv, raw);
+@@ -543,10 +545,7 @@ vec3 woundMarks(vec3 color) {
+     bool near = false;
+     vec3 tint = vec3(1.0);
+     float wet = 0.0;
+-    // A grey, unsaturated surface is taken for metal: it takes blood smears and runs but no tear or soak.
+-    vec3 base = toLight(color);
+-    float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
+-    float grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
++    float grey = 0.0;
+     for (int i = 0; i < 12; ++i) {
+         if (float(i) >= woundCount) break;
+         vec4 A = woundA[i], B = woundB[i], C = woundC[i];
+@@ -556,6 +555,10 @@ vec3 woundMarks(vec3 color) {
+         if (!near) {
+             n = viewNormal(uv, p);
+             near = true;
++            // A grey, unsaturated surface is taken for metal: it takes blood smears and runs but no tear or soak.
++            vec3 base = toLight(color);
++            float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
++            grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
+         }
+         // The hit point lies on the body, so a surface well in front of it along its normal is an outer
+         // layer: cloth, padding or armour (inferred from geometry; a loose collision shape can blur it).
+@@ -1280,7 +1283,7 @@ enum ViewUniform : unsigned {
+     uAoHalf, uSsrHalf, uHalfSize, uAoStrength, uSsrOn, uBounceOn, uBounceStrength, uSharpen, uPreviousDepth, uSurfacesOn, uSsrSize, uDofOn, uDistanceHalf, uDistanceHalfOn,
+     uFrameOffset, uCurrent, uHistory, uToPrevious, uPreviousProjection, uHistoryWeight, uDofHalf, uCells, uExposure,
+     uSilhouette, uSilhouetteOn, uHeldDetail, uHeldNoise, uHeldData, uLevelDetail, uLevelRow0, uLevelRow1, uLevelRow2, uLevelPeople,
+-    uWoundA, uWoundB, uWoundC, uWoundCount, viewUniformCount
++    uWoundA, uWoundB, uWoundC, uWoundCount, uWoundRect, viewUniformCount
+ };
+ static const char* const viewUniformNames[viewUniformCount] = {
+     "sceneTex", "depthTex", "texel", "projection", "depthLinear", "pixelScale", "encoded",
+@@ -1288,7 +1291,7 @@ static const char* const viewUniformNames[viewUniformCount] = {
+     "aoHalf", "ssrHalf", "halfSize", "aoStrength", "ssrOn", "bounceOn", "bounceStrength", "sharpen", "previousDepth", "surfacesOn", "ssrSize", "dofOn", "distanceHalf", "distanceHalfOn",
+     "frameOffset", "current", "history", "toPrevious", "previousProjection", "historyWeight", "dofHalf", "cells", "exposure",
+     "silhouette", "silhouetteOn", "heldDetail", "heldNoise", "heldData", "levelDetail", "levelRow0", "levelRow1", "levelRow2", "levelPeople",
+-    "woundA", "woundB", "woundC", "woundCount"};
++    "woundA", "woundB", "woundC", "woundCount", "woundRect"};
+ struct ViewProgramUniforms { GLint at[viewUniformCount]; };
+ enum ViewProgram : unsigned {
+     programAo, programSsr, programDof, programFinish, programComposite, programResolve, programDofComposite,
+@@ -2933,6 +2936,21 @@ static void drawViewEffectsOwned(uintptr_t view, const ViewRequest& request) {
+                 g.uniform4fv(u.at[uWoundA], GLsizei(wounds.count), &wounds.a[0][0]);
+                 g.uniform4fv(u.at[uWoundB], GLsizei(wounds.count), &wounds.b[0][0]);
+                 g.uniform4fv(u.at[uWoundC], GLsizei(wounds.count), &wounds.c[0][0]);
++                // The screen box of every wound's reach (centre +- half length + runs + 6 cm, as the shader
++                // tests); a wound the camera stands within covers the whole view.
++                float box[4] = {1.f, 1.f, 0.f, 0.f};
++                for (unsigned k = 0; k < wounds.count; ++k) {
++                    const float* c = wounds.a[k];
++                    const float reach = c[3] + wounds.c[k][3] + 6.f, depth = -c[2];
++                    if (!(depth - reach > 1.f)) { box[0] = box[1] = 0.f; box[2] = box[3] = 1.f; break; }
++                    const float sx = (projection.p0 * c[0] / depth - projection.p8) * 0.5f + 0.5f;
++                    const float sy = (projection.p5 * c[1] / depth - projection.p9) * 0.5f + 0.5f;
++                    const float rx = std::abs(projection.p0) * reach / (depth - reach) * 0.5f;
++                    const float ry = std::abs(projection.p5) * reach / (depth - reach) * 0.5f;
++                    box[0] = (std::min)(box[0], sx - rx); box[1] = (std::min)(box[1], sy - ry);
++                    box[2] = (std::max)(box[2], sx + rx); box[3] = (std::max)(box[3], sy + ry);
++                }
++                g.uniform4f(u.at[uWoundRect], box[0], box[1], box[2], box[3]);
+             }
+             g.uniform1f(u.at[uExposure], exposure);
+             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+diff --git src/mod/wounds_bake.inl src/mod/wounds_bake.inl
+index 3b4a1fb..b79a980 100644
+--- src/mod/wounds_bake.inl
++++ src/mod/wounds_bake.inl
+@@ -3,7 +3,9 @@
+ // 0x208140). Baked marks sit in the skin, follow every fold and are covered by clothes and armour.
+ // Included after stone_skin.inl, whose face-split draw (skinFacesEmit) it shares. Stage 1: the
+ // diffuse map only; wet shine, blood runs and anything on cloth or armour stay with the screen pass
+-// (view_effects.inl woundMarks), which leaves out the skin part of a baked mark.
++// (view_effects.inl woundMarks), which leaves out the skin part of a baked mark. Stage 2: the gash's depth,
++// lips and a bruise's swelling go into a copy of the normal map too (unit 2), and the player's own
++// body in first person takes both copies through the headwear path's swap (stone_skin.inl).
+ //
+ // 1. Mapping, once per wound: the hit, kept in its body part's frame, is carried into the frame of
+ //    the bone of the character's _SKIN mesh that is that part's scene node; the nearest body face
+@@ -23,14 +25,19 @@
+ constexpr unsigned woundSkinLimit = fp::CueResources::woundSkinLimit, woundSkinMarks = 16;
+ constexpr float woundMapReachCm = 12.f;
+ 
+-struct WoundSkinSlot {
+-    uintptr_t character = 0, actor = 0; // the character and its scene node (character +0x18)
+-    GLuint source = 0;                  // the body material's own diffuse, recorded at its draw
++struct WoundSkinMap { // one of the body material's maps and its copy's shape
++    GLuint source = 0;
+     GLint width = 0, height = 0, levels = 0;
+     GLenum format = 0;
++    bool failed = false;
++};
++struct WoundSkinSlot {
++    uintptr_t character = 0, actor = 0; // the character and its scene node (character +0x18)
++    uintptr_t material = 0;             // the body material whose maps were recorded at its draw
++    WoundSkinMap diffuse, normal;       // units 0 and 2
+     unsigned bakedVersion = 0;
+     ULONGLONG bakedAt = 0;
+-    bool ready = false, failed = false;
++    bool ready = false, normalReady = false;
+ };
+ static WoundSkinSlot woundSkinSlots[woundSkinLimit]; // render thread only
+ static std::atomic<unsigned> woundSkinBakes{0}, woundSkinMapped{0}, woundSkinUnmapped{0}, woundSkinDraws{0}, woundSkinFaults{0};
+@@ -294,7 +301,55 @@ void main() {
+ }
+ )glsl";
+ 
+-static GLuint woundSkinProgram(gl::Api& g) {
++// The normal map's copy: the marks' height (cm) as a slope on the map's tangent-space x/y, the way the
++// game's skin shading reads it (shading.flb shadesss_f: xy * 2 - 1, x along the vertex tangent, y along
++// normal x tangent times its sign; taken here as +u and +v, inferred). Screen derivatives of the UV-space
++// render are per texel; each slope is scaled by the cm per UV of the mark nearest the texel.
++static const char* const woundSkinNormalFragment = R"glsl(#version 130
++uniform sampler2D baseTex;
++uniform vec4 markP[16];
++uniform vec4 markQ[16];
++uniform vec4 markR[16];
++uniform float markCount;
++uniform vec2 texSize;
++in vec2 texUv;
++out vec4 fragColor;
++void main() {
++    vec4 base = textureLod(baseTex, texUv, 0.0);
++    float h = 0.0, best = 1e9;
++    vec2 cmPerUv = vec2(1.0);
++    for (int i = 0; i < 16; ++i) {
++        if (float(i) >= markCount) break;
++        vec4 P = markP[i], Q = markQ[i], R = markR[i];
++        vec2 o = texUv - P.xy;
++        vec2 q = vec2(dot(P.zw, o), dot(Q.xy, o));
++        float kind = floor(R.x + 0.01);
++        float severity = R.y, seed = R.z, near;
++        if (kind == 2.0) {
++            float r = length(q) / Q.z;
++            h += 0.15 * severity * (1.0 - smoothstep(0.0, 1.0, r)); // the swelling
++            near = r;
++        } else {
++            float a = q.x / Q.z;
++            float taper = sqrt(max(1.0 - a * a, 0.0));
++            float wobble = 0.22 * Q.w * sin(a * 5.0 + seed * 40.0);
++            float x = abs(q.y - wobble) / max(Q.w * (0.25 + 0.75 * taper), 0.05);
++            float lip = taper * smoothstep(0.7, 1.1, x) * (1.0 - smoothstep(1.3, 2.4, x));
++            h += -0.4 * severity * taper * (1.0 - smoothstep(0.0, 1.0, x)) + 0.12 * severity * lip; // the gash, its lips
++            near = max(abs(a), x * 0.25);
++        }
++        if (near < best) {
++            best = near;
++            cmPerUv = vec2(length(vec2(P.z, Q.x)), length(vec2(P.w, Q.y)));
++        }
++    }
++    vec2 slope = vec2(dFdx(h) * texSize.x, dFdy(h) * texSize.y) / max(cmPerUv, vec2(1e-4));
++    vec2 n = clamp(base.xy * 2.0 - 1.0 - slope, vec2(-0.95), vec2(0.95));
++    fragColor = vec4(n * 0.5 + 0.5, base.z, base.w);
++}
++)glsl";
++
++static GLuint woundSkinProgram(gl::Api& g, const char* fragmentText) {
+     auto compile = [&](GLenum type, const char* text) -> GLuint {
+         const GLuint shader = g.createShader(type);
+         if (!shader) return 0;
+@@ -305,7 +360,7 @@ static GLuint woundSkinProgram(gl::Api& g) {
+         if (!ok) { g.deleteShader(shader); return 0; }
+         return shader;
+     };
+-    const GLuint vertex = compile(glc::vertexShader, woundSkinVertex), fragment = compile(glc::fragmentShader, woundSkinFragment);
++    const GLuint vertex = compile(glc::vertexShader, woundSkinVertex), fragment = compile(glc::fragmentShader, fragmentText);
+     GLuint program = vertex && fragment ? g.createProgram() : 0;
+     if (program) {
+         g.attachShader(program, vertex);
+@@ -324,28 +379,29 @@ static GLuint woundSkinProgram(gl::Api& g) {
+ }
+ 
+ // The slot's texture: the original's size and format (uncompressed 8-bit colour only), full mip chain.
+-static bool woundSkinTexture(fp::CueResources& r, const WoundSkinGl& s, unsigned k) {
+-    WoundSkinSlot& slot = woundSkinSlots[k];
+-    if (r.woundSkinTex[k] && slot.width && slot.format) return true;
++// A map's copy: the original's size and format (uncompressed 8-bit only; the normal map may be
++// two-channel), full mip chain. `copy` is the context's texture name for it.
++static bool woundSkinTexture(const WoundSkinGl& s, WoundSkinMap& map, unsigned& copy) {
++    if (copy && map.width && map.format) return true;
+     GLint width = 0, height = 0, format = 0;
+-    s.level(slot.source, 0, 0x1000 /* WIDTH */, &width);
+-    s.level(slot.source, 0, 0x1001 /* HEIGHT */, &height);
+-    s.level(slot.source, 0, 0x1003 /* INTERNAL_FORMAT */, &format);
+-    const bool colour = format == 0x8058 /* RGBA8 */ || format == 0x8C43 /* SRGB8_ALPHA8 */ ||
+-                        format == 0x8051 /* RGB8 */ || format == 0x8C41 /* SRGB8 */;
+-    if (width < 16 || height < 16 || width > 8192 || height > 8192 || !colour) { slot.failed = true; return false; }
+-    if (r.woundSkinTex[k]) { glDeleteTextures(1, &r.woundSkinTex[k]); r.woundSkinTex[k] = 0; }
+-    s.stone.create(GL_TEXTURE_2D, 1, &r.woundSkinTex[k]);
+-    if (!r.woundSkinTex[k]) { slot.failed = true; return false; }
++    s.level(map.source, 0, 0x1000 /* WIDTH */, &width);
++    s.level(map.source, 0, 0x1001 /* HEIGHT */, &height);
++    s.level(map.source, 0, 0x1003 /* INTERNAL_FORMAT */, &format);
++    const bool plain = format == 0x8058 /* RGBA8 */ || format == 0x8C43 /* SRGB8_ALPHA8 */ || format == 0x8051 /* RGB8 */ ||
++                       format == 0x8C41 /* SRGB8 */ || format == 0x822B /* RG8 */;
++    if (width < 16 || height < 16 || width > 8192 || height > 8192 || !plain) { map.failed = true; return false; }
++    if (copy) { glDeleteTextures(1, &copy); copy = 0; }
++    s.stone.create(GL_TEXTURE_2D, 1, &copy);
++    if (!copy) { map.failed = true; return false; }
+     GLint levels = 1;
+     for (GLint size = (std::max)(width, height); size > 1; size /= 2) ++levels;
+-    s.stone.storage(r.woundSkinTex[k], levels, GLenum(format), width, height);
+-    s.stone.parameter(r.woundSkinTex[k], 0x2801, 0x2703); // LINEAR_MIPMAP_LINEAR
+-    s.stone.parameter(r.woundSkinTex[k], 0x2800, 0x2601); // LINEAR
+-    slot.width = width;
+-    slot.height = height;
+-    slot.levels = levels;
+-    slot.format = GLenum(format);
++    s.stone.storage(copy, levels, GLenum(format), width, height);
++    s.stone.parameter(copy, 0x2801, 0x2703); // LINEAR_MIPMAP_LINEAR
++    s.stone.parameter(copy, 0x2800, 0x2601); // LINEAR
++    map.width = width;
++    map.height = height;
++    map.levels = levels;
++    map.format = GLenum(format);
+     return true;
+ }
+ 
+@@ -378,7 +434,8 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+     WoundSkinGl s{};
+     if (!loadWoundSkinGl(s) || !g.uniform4fv || !g.genFramebuffers) { woundSkinBroken = true; return; }
+     if (!r.woundBakeProgram) {
+-        r.woundBakeProgram = woundSkinProgram(g);
++        r.woundBakeProgram = woundSkinProgram(g, woundSkinFragment);
++        r.woundBakeNormalProgram = woundSkinProgram(g, woundSkinNormalFragment); // none: colour only
+         if (!r.woundBakeProgram) { woundSkinBroken = true; return; }
+         g.genVertexArrays(1, &r.woundBakeVao);
+         g.genBuffers(1, &r.woundBakeVbo);
+@@ -399,7 +456,7 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+         unsigned baked = 0;
+         for (unsigned k = 0; k < woundSkinLimit && baked < 2; ++k) {
+             WoundSkinSlot& slot = woundSkinSlots[k];
+-            if (!slot.character || !slot.source || slot.failed) continue;
++            if (!slot.character || !slot.diffuse.source || slot.diffuse.failed) continue;
+             // Marks change (a new one, a mend) or age (bruises darken, mends close): re-bake then, at most every 2 s.
+             const bool changed = slot.bakedVersion != woundSkinVersion;
+             const bool aging = slot.ready && now - slot.bakedAt >= 2000;
+@@ -434,37 +491,43 @@ static void bakeWoundSkins(gl::Api& g, fp::CueResources& r) {
+                 ++count;
+             }
+             if (!count) continue;
+-            if (!woundSkinTexture(r, s, k)) continue;
+-            // The original into the copy, then the marks over it.
+-            s.copy(slot.source, GL_TEXTURE_2D, 0, 0, 0, 0, r.woundSkinTex[k], GL_TEXTURE_2D, 0, 0, 0, 0, slot.width, slot.height, 1);
+-            g.bindFramebuffer(glc::framebuffer, r.woundBakeFbo);
+-            g.framebufferTexture2D(glc::framebuffer, glc::colorAttachment0, GL_TEXTURE_2D, r.woundSkinTex[k], 0);
+-            if (!slot.ready && g.checkFramebufferStatus(glc::framebuffer) != glc::framebufferComplete) { slot.failed = true; continue; }
+-            setViewport(g, 0, 0, slot.width, slot.height);
+-            glDisable(GL_BLEND);
+-            glDisable(GL_DEPTH_TEST);
+-            glDisable(GL_CULL_FACE);
+-            glDisable(GL_SCISSOR_TEST);
+-            glDisable(GL_STENCIL_TEST);
+-            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+-            const bool srgb = slot.format == 0x8C43 || slot.format == 0x8C41;
+-            (srgb ? glEnable : glDisable)(glc::framebufferSrgb);
+-            g.useProgram(r.woundBakeProgram);
+-            g.activeTexture(glc::texture0);
+-            g.bindTexture(GL_TEXTURE_2D, slot.source);
+-            if (g.bindSampler) g.bindSampler(0, 0);
+-            g.uniform1i(g.getUniformLocation(r.woundBakeProgram, "baseTex"), 0);
+-            g.uniform1f(g.getUniformLocation(r.woundBakeProgram, "markCount"), float(count));
+-            g.uniform4fv(g.getUniformLocation(r.woundBakeProgram, "markP"), GLsizei(count), &P[0][0]);
+-            g.uniform4fv(g.getUniformLocation(r.woundBakeProgram, "markQ"), GLsizei(count), &Q[0][0]);
+-            g.uniform4fv(g.getUniformLocation(r.woundBakeProgram, "markR"), GLsizei(count), &R[0][0]);
+-            g.bindVertexArray(r.woundBakeVao);
+-            g.bindBuffer(glc::arrayBuffer, r.woundBakeVbo);
+-            g.bufferData(glc::arrayBuffer, ptrdiff_t(count * 6 * 8), corners, glc::dynamicDraw);
+-            g.vertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, nullptr);
+-            g.enableVertexAttribArray(0);
+-            glDrawArrays(GL_TRIANGLES, 0, GLsizei(count * 6));
+-            s.mipmap(r.woundSkinTex[k]);
++            // Each map: the original into the copy, then the marks over it in UV space, then mipmaps.
++            auto bakeMap = [&](WoundSkinMap& map, unsigned& copy, GLuint program, bool known) -> bool {
++                if (!program || !map.source || map.failed || !woundSkinTexture(s, map, copy)) return false;
++                s.copy(map.source, GL_TEXTURE_2D, 0, 0, 0, 0, copy, GL_TEXTURE_2D, 0, 0, 0, 0, map.width, map.height, 1);
++                g.bindFramebuffer(glc::framebuffer, r.woundBakeFbo);
++                g.framebufferTexture2D(glc::framebuffer, glc::colorAttachment0, GL_TEXTURE_2D, copy, 0);
++                if (!known && g.checkFramebufferStatus(glc::framebuffer) != glc::framebufferComplete) { map.failed = true; return false; }
++                setViewport(g, 0, 0, map.width, map.height);
++                glDisable(GL_BLEND);
++                glDisable(GL_DEPTH_TEST);
++                glDisable(GL_CULL_FACE);
++                glDisable(GL_SCISSOR_TEST);
++                glDisable(GL_STENCIL_TEST);
++                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++                const bool srgb = map.format == 0x8C43 || map.format == 0x8C41;
++                (srgb ? glEnable : glDisable)(glc::framebufferSrgb);
++                g.useProgram(program);
++                g.activeTexture(glc::texture0);
++                g.bindTexture(GL_TEXTURE_2D, map.source);
++                if (g.bindSampler) g.bindSampler(0, 0);
++                g.uniform1i(g.getUniformLocation(program, "baseTex"), 0);
++                g.uniform1f(g.getUniformLocation(program, "markCount"), float(count));
++                g.uniform2f(g.getUniformLocation(program, "texSize"), float(map.width), float(map.height));
++                g.uniform4fv(g.getUniformLocation(program, "markP"), GLsizei(count), &P[0][0]);
++                g.uniform4fv(g.getUniformLocation(program, "markQ"), GLsizei(count), &Q[0][0]);
++                g.uniform4fv(g.getUniformLocation(program, "markR"), GLsizei(count), &R[0][0]);
++                g.bindVertexArray(r.woundBakeVao);
++                g.bindBuffer(glc::arrayBuffer, r.woundBakeVbo);
++                g.bufferData(glc::arrayBuffer, ptrdiff_t(count * 6 * 8), corners, glc::dynamicDraw);
++                g.vertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, nullptr);
++                g.enableVertexAttribArray(0);
++                glDrawArrays(GL_TRIANGLES, 0, GLsizei(count * 6));
++                s.mipmap(copy);
++                return true;
++            };
++            if (!bakeMap(slot.diffuse, r.woundSkinTex[k], r.woundBakeProgram, slot.ready)) continue;
++            slot.normalReady = bakeMap(slot.normal, r.woundSkinNrm[k], r.woundBakeNormalProgram, slot.normalReady);
+             slot.bakedVersion = woundSkinVersion;
+             slot.bakedAt = ages ? now : now + 0x7fffffffull; // nothing ages: no re-bake until the marks change
+             slot.ready = true;
+@@ -493,9 +556,29 @@ static bool woundSkinSubmission(uintptr_t node) {
+     return woundSkinSlotOf(node) >= 0;
+ }
+ 
+-static const GLuint* woundSkinReplacement(fp::CueResources& r, const StoneGl&, const void* slot) {
+-    const unsigned k = *(const unsigned*)slot;
+-    return r.woundSkinTex[k] ? &r.woundSkinTex[k] : nullptr;
++struct WoundSkinSwap { unsigned slot; GLuint textures[3]; };
++static const GLuint* woundSkinReplacement(fp::CueResources& r, const StoneGl&, const void* context) {
++    auto* swap = (WoundSkinSwap*)const_cast<void*>(context);
++    const unsigned k = swap->slot;
++    if (!r.woundSkinTex[k]) return nullptr;
++    swap->textures[0] = r.woundSkinTex[k];
++    if (woundSkinSlots[k].normalReady && r.woundSkinNrm[k]) swap->textures[2] = r.woundSkinNrm[k];
++    return swap->textures;
++}
++
++// Records the body material's maps on its first draw (or when the game re-made that material's
++// textures); true when the slot's copies stand for exactly these originals.
++static bool woundSkinCurrent(WoundSkinSlot& slot, uintptr_t material, const GLuint* originals) {
++    if (slot.material && slot.material != material) return false; // another part of the mesh keeps its own maps
++    if (slot.material == material && slot.diffuse.source == originals[0] && slot.normal.source == originals[2]) return slot.ready;
++    slot.material = material;
++    slot.diffuse = {};
++    slot.normal = {};
++    slot.diffuse.source = originals[0];
++    slot.normal.source = originals[2];
++    slot.ready = slot.normalReady = false;
++    slot.bakedVersion = 0;
++    return false;
+ }
+ 
+ static bool woundSkinDrawBody(uintptr_t node, uintptr_t material, bool bind) {
+@@ -518,18 +601,9 @@ static bool woundSkinDrawBody(uintptr_t node, uintptr_t material, bool bind) {
+         faces += body[f];
+     }
+     if (!faces) return false;
+-    // The first body material drawn gives the diffuse the bake copies; another material of the same
+-    // mesh (a second skin part) keeps its own texture and draws natively.
+-    if (!slot.source) {
+-        slot.source = originals[0];
+-        slot.ready = slot.failed = false;
+-        slot.width = 0;
+-        return false;
+-    }
+-    if (slot.source != originals[0]) return false;
+-    if (!slot.ready) return false;
+-    const unsigned k = unsigned(found);
+-    return skinFacesEmit(plan, bind, body.data(), originals, 1, woundSkinReplacement, &k);
++    if (!woundSkinCurrent(slot, material, originals)) return false;
++    WoundSkinSwap swap{unsigned(found), {originals[0], originals[1], originals[2]}};
++    return skinFacesEmit(plan, bind, body.data(), originals, 3, woundSkinReplacement, &swap);
+ }
+ 
+ static bool woundSkinDrawGuarded(uintptr_t node, uintptr_t material, bool bind) {
+@@ -549,3 +623,31 @@ static bool woundSkinDraw(uintptr_t node, uintptr_t material, bool bind) {
+     if (drawn) woundSkinDraws.fetch_add(1, std::memory_order_relaxed);
+     return drawn;
+ }
++
++// The player's own skinned mesh in first person stays with the headwear path, which swaps maps for the
++// body's runs through StoneSwap (stone_skin.inl falls back to this when the player is not stone).
++static bool woundSkinWearBegin(uintptr_t node, uintptr_t material, StoneSwap& swap) {
++    swap = {};
++    if (woundSkinBroken || !wearScope.colourPass) return false;
++    __try {
++        const int found = woundSkinSlotOf(node);
++        if (found < 0 || !stoneSkinOriginals(material, swap.originals)) return false;
++        WoundSkinSlot& slot = woundSkinSlots[found];
++        if (!woundSkinCurrent(slot, material, swap.originals)) return false;
++        StoneGl s{};
++        if (!loadStoneGl(s)) return false;
++        auto* owner = prepareCue();
++        if (!owner || !owner->resources.woundSkinTex[found]) return false;
++        swap.stone[0] = owner->resources.woundSkinTex[found];
++        swap.stone[1] = swap.originals[1];
++        swap.stone[2] = slot.normalReady && owner->resources.woundSkinNrm[found] ? owner->resources.woundSkinNrm[found]
++                                                                                   : swap.originals[2];
++        swap.bind = s.bind;
++        swap.on = true;
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        woundSkinFaults.fetch_add(1, std::memory_order_relaxed);
++        swap = {};
++    }
++    if (swap.on) woundSkinDraws.fetch_add(1, std::memory_order_relaxed);
++    return swap.on;
++}

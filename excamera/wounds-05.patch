@@ -1,0 +1,80 @@
+diff --git src/mod/view_effects.inl src/mod/view_effects.inl
+index 88c5d34..d404ff8 100644
+--- src/mod/view_effects.inl
++++ src/mod/view_effects.inl
+@@ -530,6 +530,10 @@ vec3 woundMarks(vec3 color) {
+     bool near = false;
+     vec3 tint = vec3(1.0);
+     float wet = 0.0;
++    // A grey, unsaturated surface is taken for metal: it takes blood smears and runs but no tear or soak.
++    vec3 base = toLight(color);
++    float brightest = max(base.r, max(base.g, base.b)), darkest = min(base.r, min(base.g, base.b));
++    float grey = 1.0 - smoothstep(0.08, 0.2, (brightest - darkest) / max(brightest, 1e-4));
+     for (int i = 0; i < 12; ++i) {
+         if (float(i) >= woundCount) break;
+         vec4 A = woundA[i], B = woundB[i], C = woundC[i];
+@@ -540,8 +544,13 @@ vec3 woundMarks(vec3 color) {
+             n = viewNormal(uv, p);
+             near = true;
+         }
++        // The hit point lies on the body, so a surface well in front of it along its normal is an outer
++        // layer: cloth, padding or armour (inferred from geometry; a loose collision shape can blur it).
++        float off = dot(d, n);
++        float layer = smoothstep(0.6, 1.6, off);
++        float metal = layer * grey, cloth = layer * (1.0 - grey);
+         // Only the surface at the wound: something a few cm off it (another limb, a wall behind) is left alone.
+-        float stick = 1.0 - smoothstep(2.0, 4.5, abs(dot(d, n)));
++        float stick = 1.0 - smoothstep(2.0 + 2.5 * layer, 4.5 + 2.5 * layer, abs(off));
+         if (stick <= 0.0) continue;
+         vec3 t = B.xyz - n * dot(B.xyz, n);
+         if (dot(t, t) < 1e-4) t = cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0));
+@@ -554,7 +563,7 @@ vec3 woundMarks(vec3 color) {
+             // A bruise: mottled purple, red-brown where the blow landed hardest, torn there on a heavy one.
+             float mottle = 0.78 + 0.22 * sin(q.x * 0.9 + seed * 31.0) * sin(q.y * 1.3 - seed * 17.0);
+             float r = length(q) / (A.w * mottle);
+-            float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick;
++            float w = (1.0 - smoothstep(0.3, 1.0, r)) * (0.5 + 0.4 * severity) * stick * (1.0 - layer); // skin only
+             // Fresh it is an angry red swelling; over the next minute and a half it darkens to purple.
+             vec3 outer = mix(vec3(0.85, 0.42, 0.4), vec3(0.62, 0.45, 0.62), aux);
+             vec3 inner = mix(vec3(0.6, 0.18, 0.16), vec3(0.42, 0.17, 0.2), aux);
+@@ -580,6 +589,27 @@ vec3 woundMarks(vec3 color) {
+         vec3 cut = mix(vec3(1.0), mix(vec3(0.55, 0.3, 0.24), vec3(0.7, 0.22, 0.2), aux), smear * (0.55 + 0.35 * severity));
+         cut = mix(cut, vec3(1.0, 0.5, 0.45) * (1.0 + 0.3 * facing), lip * 0.8);
+         cut = mix(cut, mix(vec3(0.5, 0.035, 0.03), vec3(0.07, 0.003, 0.003), 1.0 - smoothstep(0.0, 0.8, x)), inside);
++        // Through cloth or padding: a ragged slit with frayed threads at its edge and the dark wound behind,
++        // and blood soaking outward through the weave, wider the longer the wound bleeds, with a dried rim.
++        float rag = 0.35 * (woundHash(floor(q.x * 3.0) + seed * 17.0) - 0.5);
++        float xs = abs(q.y - wobble) / max(C.z * 0.7 * taper, 0.05) + rag;
++        float slit = taper > 0.0 ? 1.0 - smoothstep(0.5, 0.9, xs) : 0.0;
++        float fray = taper * smoothstep(0.8, 1.0, xs) * (1.0 - smoothstep(1.0, 1.9, xs)) *
++                     step(0.45, fract(q.x * 2.5 + woundHash(floor(q.x * 2.5) + seed)));
++        float spread = A.w * 0.5 + C.z * 2.0 + C.w * 0.45;
++        float e = length(vec2(q.x / (A.w * 1.1 + C.w * 0.2), q.y / spread)) *
++                  (0.8 + 0.4 * woundHash(floor(q.x * 0.8) + floor(q.y * 0.8) * 13.0 + seed * 7.0));
++        float soak = (1.0 - smoothstep(0.75, 1.0, e)) * (0.5 + 0.5 * severity);
++        float tide = smoothstep(0.7, 0.9, e) * (1.0 - smoothstep(0.9, 1.0, e));
++        vec3 stain = mix(vec3(0.42, 0.16, 0.12), vec3(0.5, 0.07, 0.06), aux);
++        vec3 fabric = mix(vec3(1.0), stain, soak * 0.85);
++        fabric = mix(fabric, stain * 0.7, tide * 0.5);
++        fabric = mix(fabric, fabric * 0.65, fray);
++        fabric = mix(fabric, vec3(0.1, 0.02, 0.02), slit);
++        vec3 plate = mix(vec3(1.0), blood * 1.6, smear * 0.6);
++        cut = mix(cut, fabric, cloth);
++        cut = mix(cut, plate, metal);
++        inside = mix(inside, slit, cloth) * (1.0 - metal);
+         float run = 0.0;
+         vec3 down = n * dot(worldUp.xyz, n) - worldUp.xyz; // straight down, along the surface
+         if (C.w > 0.0 && dot(down, down) > 0.04) {
+@@ -600,10 +630,10 @@ vec3 woundMarks(vec3 color) {
+                 float line = 1.0 - smoothstep(thick * bead * 0.5, thick * bead, abs(across - at - 0.3 * sin(below * 0.4 + fk)));
+                 run = max(run, line * step(0.0, along) * (1.0 - smoothstep(len * 0.85, len, along)));
+             }
+-            cut = mix(cut, blood, run * 0.9);
++            cut = mix(cut, blood, run * 0.9 * (1.0 - 0.7 * cloth)); // cloth drinks most of it
+         }
+         tint *= mix(vec3(1.0), cut, stick);
+-        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux);
++        wet += (inside * (0.5 + 0.5 * severity) + 0.6 * run) * stick * (0.15 + 0.85 * aux) * (1.0 - 0.6 * cloth);
+     }
+     if (!near) return color;
+     vec3 lit = toLight(color);

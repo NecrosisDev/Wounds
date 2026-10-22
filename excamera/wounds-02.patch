@@ -1,0 +1,97 @@
+diff --git src/mod/wounds.inl src/mod/wounds.inl
+index 246e145..928f010 100644
+--- src/mod/wounds.inl
++++ src/mod/wounds.inl
+@@ -36,6 +36,7 @@ struct Wound {
+     float local[3]{}, along[3]{};  // centre and the blade's path, in the part's own frame
+     float halfLength = 0.f, halfWidth = 0.f, severity = 0.f, seed = 0.f;
+     ULONGLONG born = 0;
++    float fade = 1.f; // 1 as struck; closes towards 0 while the character is marked injuries.mend
+     uint8_t kind = 0;
+ };
+ 
+@@ -53,7 +54,30 @@ static uint32_t woundSerial = 0; // the newest record taken
+ static SRWLOCK woundLock = SRWLOCK_INIT;
+ static std::atomic<CharacterHits> characterHits{nullptr};
+ static std::atomic<ULONGLONG> characterHitsProbed{0};
+-static std::atomic<unsigned> woundsTaken{0}, woundsRetired{0}, woundFaults{0};
++static std::atomic<unsigned> woundsTaken{0}, woundsRetired{0}, woundFaults{0}, woundsMended{0};
++
++// Regeneration (the Injuries addon's "injuries.mend" mark, value = seconds to close a wound
++// fully): ScriptRuntime.dll's character_mark_nodes export (marks version 1).
++using WoundMarkNodes = int (*)(const char*, uintptr_t*, uint32_t*, int);
++using WoundMarksVersion = uint32_t (*)();
++constexpr unsigned woundMendLimit = 64;
++static std::atomic<WoundMarkNodes> woundMarkNodes{nullptr};
++static std::atomic<ULONGLONG> woundMarksProbed{0};
++static ULONGLONG woundFadeTick = 0; // woundLock
++
++static WoundMarkNodes woundMarkExport() {
++    if (auto fn = woundMarkNodes.load(std::memory_order_acquire)) return fn;
++    const ULONGLONG now = GetTickCount64();
++    if (now - woundMarksProbed.load(std::memory_order_relaxed) < 2000) return nullptr;
++    woundMarksProbed.store(now, std::memory_order_relaxed);
++    HMODULE runtime = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, L"ScriptRuntime.dll", &runtime) || !runtime) return nullptr;
++    const auto version = reinterpret_cast<WoundMarksVersion>(GetProcAddress(runtime, "character_marks_version"));
++    const auto fn = reinterpret_cast<WoundMarkNodes>(GetProcAddress(runtime, "character_mark_nodes"));
++    if (!version || !fn || version() != 1) return nullptr;
++    woundMarkNodes.store(fn, std::memory_order_release);
++    return fn;
++}
+ 
+ // The runtime's export, looked up again at most every two seconds until found; the module is pinned
+ // once found, so the cached entry stays valid for the life of the process.
+@@ -182,6 +206,17 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+     const ULONGLONG now = GetTickCount64();
+     AcquireSRWLockExclusive(&woundLock);
+     takeHits();
++    // Marked characters' scene nodes (character +0x18), and the seconds since the last call.
++    uintptr_t mendNodes[woundMendLimit]{};
++    uint32_t mendSeconds[woundMendLimit]{};
++    int mendCount = 0;
++    if (const WoundMarkNodes marks = woundMarkExport()) {
++        __try { mendCount = marks("injuries.mend", mendNodes, mendSeconds, int(woundMendLimit)); }
++        __except (EXCEPTION_EXECUTE_HANDLER) { mendCount = 0; woundFaults.fetch_add(1, std::memory_order_relaxed); }
++        mendCount = std::clamp(mendCount, 0, int(woundMendLimit));
++    }
++    const float fadeDt = woundFadeTick ? (std::min)(float(now - woundFadeTick) / 1000.f, 0.5f) : 0.f;
++    woundFadeTick = now;
+     for (unsigned i = 0; i < woundLimit; ++i) {
+         Wound& w = woundStore[i];
+         if (!w.part) continue;
+@@ -207,6 +242,21 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+             woundsRetired.fetch_add(1, std::memory_order_relaxed);
+             continue;
+         }
++        if (mendCount && fadeDt > 0.f) {
++            uintptr_t ownerNode = 0;
++            __try { ownerNode = *(const uintptr_t*)(owner + field::character::sceneNode); }
++            __except (EXCEPTION_EXECUTE_HANDLER) { ownerNode = 0; }
++            for (int k = 0; ownerNode && k < mendCount; ++k) {
++                if (mendNodes[k] != ownerNode || !mendSeconds[k]) continue;
++                w.fade -= fadeDt / float(mendSeconds[k]);
++                break;
++            }
++            if (w.fade <= 0.02f) { // closed
++                w = {};
++                woundsMended.fetch_add(1, std::memory_order_relaxed);
++                continue;
++            }
++        }
+         float world[3], path[3];
+         outOfPose(pose, w.local, true, world);
+         outOfPose(pose, w.along, false, path);
+@@ -246,9 +296,10 @@ static void woundViewUniforms(const float* view, WoundUniforms& out) {
+         // Fresh cuts bleed: the runs lengthen over the first half minute.
+         const float age = float(now - w.born) / 1000.f;
+         const float run = w.kind == woundCrush ? 0.f : (std::min)(age / 30.f, 1.f) * (4.f + 14.f * w.severity);
+-        const float a[4] = {s.centre[0], s.centre[1], s.centre[2], w.halfLength};
++        // A closing wound shrinks towards its middle and pales.
++        const float a[4] = {s.centre[0], s.centre[1], s.centre[2], w.halfLength * w.fade};
+         const float b[4] = {s.path[0], s.path[1], s.path[2], float(w.kind)};
+-        const float c[4] = {w.severity, w.seed, w.halfWidth, run};
++        const float c[4] = {w.severity * w.fade, w.seed, w.halfWidth * w.fade, run * w.fade};
+         memcpy(out.a[k], a, sizeof a);
+         memcpy(out.b[k], b, sizeof b);
+         memcpy(out.c[k], c, sizeof c);
