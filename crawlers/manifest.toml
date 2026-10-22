@@ -9,7 +9,8 @@ entry = "scripts/main.lua"
 requires = ["events.lifecycle", "timers"]
 # levels.serve/levels.read and assets.read splice this mod's clips (scripts/clips.bin) into the installed
 # humanoid.rsq; characters.read finds downed undead; characters.motion (play_motion) and characters.drift
-# are requested from the runtime (E:\Wounds\RUNTIME-REQUESTS.md, section 8); player.damage lands the blows.
+# come from the script runtime when it offers them (without them downed undead lie still);
+# player.damage lands the blows.
 optional = ["levels.serve", "levels.read", "assets.read", "characters.read", "characters.motion",
             "characters.drift", "player.damage"]
 memory_mb = 16
