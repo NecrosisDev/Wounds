@@ -234,7 +234,7 @@ def look(key, raise_by, captured=0.0):
     R = transforms(key)[10][0]
     face, ears = vm(FACE, R), vm(EARS, R)
     for _ in range(3):                                    # the neck leans against the chest's roll: ears level,
-        lean = math.asin(max(-1, min(1, ears[1])))        # always fully (Hunter: never scrunched to a shoulder)
+        lean = math.asin(max(-1, min(1, ears[1])))        # always fully (never scrunched to a shoulder)
         sign = 1 if dot(cross(face, ears), UP) >= 0 else -1
         turn(key, 10, face, -sign * max(-0.6, min(0.6, lean)))
         R = transforms(key)[10][0]
@@ -347,7 +347,7 @@ def keyed(*frames):
     return out
 
 
-# ---- the crawl: Mixamo's "Zombie Crawl" motion capture (Hunter's download, 2026-10-22), retargeted onto
+# ---- the crawl: Mixamo's "Zombie Crawl" motion capture (downloaded separately), retargeted onto
 # the game's 18 parts by direction: each part is turned so it points where the matching captured bone
 # points; the hips and head take the captured frame (hip line and spine, neck axis and face). The capture
 # crawls along its own +Z; that is turned onto FORWARD (toward the target). The body is not moved here:
@@ -409,7 +409,7 @@ def retarget(world):
     turn(key, 9, axis, math.atan2(dot(cross(a, b), axis), dot(a, b)))
     _set_world(key, 10, _rotation((NECK_AXIS, FACE), (d("Neck", "Head"), world["Head"][1])))
     # The captured zombie hangs its head at the floor; it keeps that sway but lifts most of the way toward
-    # the target and levels its ears (Hunter: the chest and eyes face the target).
+    # the target and levels its ears (the chest and eyes face the target).
     look(key, 0.0, captured=HEAD_KEEP)
     limit_neck(key, NECK_LIMIT)
     level_ears(key)                                        # cutting the bend short can tip the ears again
@@ -475,7 +475,7 @@ def level_ears(key):
 
 def limit_neck(key, degrees):
     """The neck and head are one rigid part: bent far from straight it juts out of the chest as a lump
-    (Hunter 13:37). Keep its bend from the standing neck within `degrees` (the capture itself stays within
+    Keep its bend from the standing neck within `degrees` (the capture itself stays within
     about 30), giving up the rest of the look toward the target."""
     q, n = to_quat(local(key, 10)), to_quat(NECK_IDLE)
     d = sum(a * b for a, b in zip(q, n))
