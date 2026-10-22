@@ -1,0 +1,58 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['injuries-v*', 'groundfighters-v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build both mods and their release ZIPs
+        run: python -X utf8 -B release.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wounds
+          path: |
+            dist/*.zip*
+            crawlers/dist/*.zip*
+          if-no-files-found: error
+
+  # injuries-v0.2.0 releases Injuries, groundfighters-v0.1.0 Ground Fighters.
+  release:
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Build the tagged mod's release ZIP
+        run: python -X utf8 -B release.py --tag "$GITHUB_REF_NAME"
+      # A version with a hyphen (injuries-v0.2.0-rc1) publishes a prerelease. An existing release is never replaced.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          assets=(dist/*.zip dist/*.zip.sha256 crawlers/dist/*.zip crawlers/dist/*.zip.sha256)
+          flags=(--verify-tag --title "$GITHUB_REF_NAME" --generate-notes)
+          [[ "${GITHUB_REF_NAME#*-v}" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" "${assets[@]}" --repo "$GITHUB_REPOSITORY" "${flags[@]}"

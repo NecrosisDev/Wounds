@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.claude/
+/dist/
+/crawlers/dist/
+# Working copies of ExCamera and of earlier Injuries states, kept while authoring the ExCamera wound delta
+/base-e*/
+/excamera-base/
+/excamera-e*/
+/excamera-work/
