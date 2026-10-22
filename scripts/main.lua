@@ -92,28 +92,46 @@ end
 -- Severed limbs: bits per target (as "injuries.severed" for ExCamera) and the stump's bleeding.
 local severed = {}      -- [target] = bits
 local stump_bleed = {}  -- [target] = seconds of bleeding left
-local function sever(target, hit_part)
+local function send_severed(target)
+    if api.has_capability("characters.marks") and characters.set_mark then
+        pcall(characters.set_mark, runtime_target(target), "injuries.severed", severed[target] or 0)
+    end
+end
+
+-- The runtime stages sever, drop_held and keep_down only from timer callbacks (a character.hit handler
+-- is not one: "only allowed in timer and event callbacks"), so the cut is decided here and done from a
+-- timer `delay` seconds later: the hand lets go first, then the joint is cut, then a legless body is
+-- kept down. If the cut is refused, the bit is taken back.
+local function sever(target, hit_part, delay)
     local cut = injuries.SEVER[hit_part]
     if not cut or not cfg.sever then return false end
-    -- A leg only where the character can be kept on the ground afterwards (requested keep_down).
+    -- A leg only where the character can be kept on the ground afterwards (keep_down).
     local keep_down = api.has_capability("characters.keep_down") and characters.keep_down
     if cut.leg and not keep_down then return false end
     if (severed[target] or 0) & (1 << cut.bit) ~= 0 then return false end
     if not (api.has_capability("characters.sever") and characters.sever) then return false end
-    local ok, done = pcall(characters.sever, runtime_target(target), cut.part)
-    if not ok or done ~= true then
-        if not ok then log.warn("sever failed: " .. tostring(done)) end
-        return false
-    end
     severed[target] = (severed[target] or 0) | (1 << cut.bit)
-    if api.has_capability("characters.marks") and characters.set_mark then
-        pcall(characters.set_mark, runtime_target(target), "injuries.severed", severed[target])
-    end
-    if cut.side and api.has_capability("characters.drop_held") and characters.drop_held then
-        pcall(characters.drop_held, runtime_target(target), cut.side)
-    end
-    if cut.leg then pcall(characters.keep_down, runtime_target(target), true) end
     stump_bleed[target] = cfg.sever_bleed
+    timers.after(delay or 0, function()
+        local who = runtime_target(target)
+        if cut.side and api.has_capability("characters.drop_held") and characters.drop_held then
+            local ok, err = pcall(characters.drop_held, who, cut.side)
+            if not ok then log.warn("drop_held failed: " .. tostring(err)) end
+        end
+        local ok, done = pcall(characters.sever, who, cut.part)
+        if not ok or done ~= true then
+            if not ok then log.warn("sever failed: " .. tostring(done)) end
+            severed[target] = (severed[target] or 0) & ~(1 << cut.bit)
+            if severed[target] == 0 then severed[target], stump_bleed[target] = nil, nil end
+            send_severed(target)
+            return
+        end
+        send_severed(target)
+        if cut.leg then
+            local kept, err = pcall(characters.keep_down, who, true)
+            if not kept then log.warn("keep_down failed: " .. tostring(err)) end
+        end
+    end)
     return true
 end
 
@@ -193,11 +211,21 @@ local function break_neck(hit)
     end)
 end
 
+-- Who each tracked handle belonged to when first hit. An arena round brings new characters, possibly on
+-- rows the old ones used: a handle that is gone from a complete snapshot, or that now holds a different
+-- record, is forgotten (forget, below), so nothing (injuries, cuts, burns, marks) carries over to someone else.
+local who = {}   -- ["h<handle>"] = record_id
+local forget
+
 events.on("character.hit", function(hit)
     if not cfg.enabled or hit.blocked or hit.parried or not hit.part then return end
     if not hit.is_player and not cfg.npcs then return end
     local target = hit.is_player and "player" or key_of(hit.handle and {handle = hit.handle} or hit.record_id)
     if target == nil then return end
+    if type(target) == "string" and target:sub(1, 1) == "h" then
+        if who[target] ~= nil and who[target] ~= hit.record_id then forget(target) end   -- a new body on an old row
+        who[target] = hit.record_id
+    end
     local blunt = injuries.blunt(hit, weapon_of(hit.weapon_id))
     if not blunt and (hit.health_damage or 0) >= cfg.sever_at and sever(target, hit.part) then
         if hit.is_player then
@@ -219,8 +247,10 @@ events.on("character.hit", function(hit)
     local side = injuries.ARM_SIDE[injury.part]
     if side and injury.kind == "broken" and injury.severity >= cfg.drop_at and
             api.has_capability("characters.drop_held") and characters.drop_held then
-        local ok, err = pcall(characters.drop_held, runtime_target(target), side)
-        if not ok then log.warn("drop_held failed: " .. tostring(err)) end
+        timers.after(0, function()   -- staged calls only from a timer callback (see sever)
+            local ok, err = pcall(characters.drop_held, runtime_target(target), side)
+            if not ok then log.warn("drop_held failed: " .. tostring(err)) end
+        end)
     end
     if hit.is_player then
         save_player()
@@ -369,7 +399,31 @@ if addons and addons.on then
 end
 
 local last_tick = nil
+forget = function(target)
+    if api.has_capability("characters.marks") and characters.set_mark then   -- the row may hold a new body now
+        for _, mark in ipairs({"injuries.broken", "injuries.severed", "injuries.burn", "injuries.burnscar", "injuries.mend"}) do
+            pcall(characters.set_mark, runtime_target(target), mark, 0)
+        end
+    end
+    injuries.forget(target)
+    severed[target], stump_bleed[target], broken_sent[target] = nil, nil, nil
+    burns[target], burn_peak[target], burn_sent[target], burn_last[target], scars[target], scar_sent[target] = nil, nil, nil, nil, nil, nil
+    mending[target], who[target] = nil, nil
+end
+local function prune()
+    if not (api.has_capability("characters.read") and characters and characters.snapshot) then return end
+    local snap = characters.snapshot()
+    if not snap then return end
+    local rows = {}
+    for _, c in ipairs(snap.characters or {}) do if c.handle then rows["h" .. c.handle] = c end end
+    for target, record in pairs(who) do
+        local row = rows[target]
+        if (row == nil and not snap.truncated) or (row ~= nil and row.record_id ~= record) then forget(target) end
+    end
+end
+
 local function tick()
+    prune()
     local now = timers.now()
     local dt = last_tick and math.max(now - last_tick, 0) or 0
     last_tick = now
@@ -416,7 +470,8 @@ events.on("runtime.phase", function(e)
         severed, stump_bleed = {}, {}
         if saved_bits then
             for hit_part, cut in pairs(injuries.SEVER) do
-                if hit_part == cut.part and saved_bits & (1 << cut.bit) ~= 0 then sever("player", hit_part) end
+                -- A moment after the session starts, so the player's body is live when the cut lands.
+                if hit_part == cut.part and saved_bits & (1 << cut.bit) ~= 0 then sever("player", hit_part, 2) end
             end
             stump_bleed = {}
         end

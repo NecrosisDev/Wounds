@@ -87,7 +87,13 @@ local function new(opts)
     end}
     if not opts.no_runtime then
         caps["characters.keep_down"] = not opts.no_keep_down
+        -- As in the runtime (r51): the staged calls work only inside a timer callback; the
+        -- character.hit handler is not one ("only allowed in timer and event callbacks").
+        local function staged(name)
+            if not s.in_timer then error("characters." .. name .. " is only allowed in timer and event callbacks") end
+        end
         env.characters.keep_down = function(target, on)
+            staged("keep_down")
             if type(target) == "table" then target = "h" .. target.handle end
             s.downed = s.downed or {}
             s.downed[target] = on
@@ -95,6 +101,7 @@ local function new(opts)
         end
         caps["characters.sever"] = true
         env.characters.sever = function(target, part)
+            staged("sever")
             assert(math.type(part) == "integer" and part >= 1 and part <= 18, "part")
             if type(target) == "table" then target = "h" .. target.handle end
             s.cuts[#s.cuts + 1] = tostring(target) .. ":" .. part
@@ -108,6 +115,7 @@ local function new(opts)
         end
         caps["characters.drop_held"] = true
         env.characters.drop_held = function(target, side)
+            staged("drop_held")
             assert(side == "right" or side == "left", "side")
             if type(target) == "table" then target = "h" .. target.handle end
             s.dropped[#s.dropped + 1] = tostring(target) .. ":" .. side
@@ -136,8 +144,13 @@ local function new(opts)
     end
     assert(loadfile(root .. "/scripts/main.lua", "t", env))()
     s.fire = function(name, e) return s.handlers[name](e) end
-    s.run_afters = function() local q = s.afters s.afters = {} for _, fn in ipairs(q) do fn() end end
-    s.tick = function(seconds) for _ = 1, seconds do s.now = s.now + 1 for _, fn in ipairs(s.timers) do if fn then fn() end end end end
+    s.run_afters = function() local q = s.afters s.afters = {} s.in_timer = true for _, fn in ipairs(q) do fn() end s.in_timer = false end
+    s.tick = function(seconds)
+        s.in_timer = true
+        for _ = 1, seconds do s.now = s.now + 1 for _, fn in ipairs(s.timers) do if fn then fn() end end end
+        s.in_timer = false
+        s.run_afters()
+    end
     return s
 end
 
@@ -266,10 +279,11 @@ local k = new()
 k.fire("runtime.phase", {phase = "session"})
 k.fire("character.hit", hit(13, 0.3, 2, {handle = 70}))      -- right forearm, mace: broken, severity 1
 assert(k.broken.h70 == 1 << 5, "forearm bit " .. tostring(k.broken.h70))
+k.run_afters()                                              -- the drop is staged from a timer
 assert(k.dropped[1] == "h70:right", "dropped " .. tostring(k.dropped[1]))
 k.fire("character.hit", hit(6, 0.3, 2, {handle = 70}))       -- left shin
 assert(k.broken.h70 == (1 << 5) | (1 << 3), "two bones")
-k.fire("character.hit", hit(15, 0.3, 1, {handle = 70}))      -- left upper arm, sword: cut, not broken
+k.fire("character.hit", hit(15, 0.18, 1, {handle = 70}))     -- left upper arm, sword: cut, not broken or cut off
 assert(#k.dropped == 1 and k.broken.h70 == (1 << 5) | (1 << 3), "a cut drops nothing and sets no bit")
 for _ = 1, 3 do k.addon_handlers["injuries.heal"]({target = {handle = 70}, amount = 1}) end
 k.tick(1)
@@ -302,6 +316,14 @@ assert(reloaded.scarred.player and reloaded.scarred.player > 60, "scar back afte
 burn({target = "x", amount = 1}) burn({target = "player", amount = -1})
 assert(f.burnt.player == nil, "junk ignored")
 
+-- A new arena round puts another character on an old row: nothing of the old one carries over.
+local rr = new()
+rr.fire("runtime.phase", {phase = "session"})
+rr.fire("character.hit", hit(13, 0.3, 2, {handle = 70}))                  -- record 7: forearm broken
+assert(rr.broken.h70 == 1 << 5, "old body's break")
+rr.fire("character.hit", hit(6, 0.3, 2, {handle = 70, record_id = 9}))    -- record 9 on the same row: shin
+assert(rr.broken.h70 == 1 << 3, "the new body has only its own break: " .. tostring(rr.broken.h70))
+
 -- Severing: a hard sword cut to a forearm takes it off at the elbow; the hand lets go, the stump bleeds,
 -- ExCamera gets the bit; a mace never severs; the player's is saved and cut again next session.
 local x = new()
@@ -309,6 +331,8 @@ x.fire("runtime.phase", {phase = "session"})
 x.fire("character.hit", hit(13, 0.4, 2, {handle = 70}))                 -- mace: no
 assert(#x.cuts == 0, "blunt never severs")
 x.fire("character.hit", hit(17, 0.4, 1, {handle = 70}))                 -- sword to the right hand: off at the elbow
+assert(#x.cuts == 0 and #x.dropped == 0, "nothing staged from inside the hit handler")
+x.run_afters()
 assert(x.cuts[1] == "h70:13" and x.severedMarks.h70 == 1 << 5, "severed " .. tostring(x.cuts[1]))
 assert(x.dropped[#x.dropped] == "h70:right", "the hand let go")
 x.tick(5)
@@ -316,16 +340,19 @@ assert(x.killed[7] and x.killed[7].health > 0 and x.killed[7].health < 0.05, "th
 x.fire("character.hit", hit(13, 0.5, 1, {handle = 70}))
 assert(#x.cuts == 1, "no second cut at the same joint")
 x.fire("character.hit", hit(16, 0.4, 1, {is_player = true, record_id = 1}))
+x.run_afters()
 assert(x.cuts[2] == "player:16" and x.notes[#x.notes]:find("left forearm is cut off"), x.notes[#x.notes])
 assert(x.save:find("|X128"), "saved " .. tostring(x.save))
 local y = new({save = x.save})
 y.fire("runtime.phase", {phase = "session"})
+y.run_afters()
 assert(y.cuts[1] == "player:16", "cut again after a reload")
 
 -- Legs: off at the knee, kept on the ground; without keep_down a leg is never cut.
 local lg = new()
 lg.fire("runtime.phase", {phase = "session"})
 lg.fire("character.hit", hit(4, 0.5, 1, {handle = 80}))                 -- a sword to the right foot: off at the knee
+lg.run_afters()
 assert(lg.cuts[1] == "h80:3" and lg.severedMarks.h80 == 1 << 1 and lg.downed.h80 == true, "leg off, kept down")
 assert(#lg.dropped == 0, "a leg drops nothing")
 local nk = new({no_keep_down = true})

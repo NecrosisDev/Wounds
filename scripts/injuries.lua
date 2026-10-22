@@ -194,6 +194,12 @@ function M.level_changed()
     injuries.player = player
 end
 
+-- One character is gone (a new arena round, or the row now belongs to someone else): drop
+-- everything kept for it. Nothing is sent: the runtime's held strength went with the old body.
+function M.forget(target)
+    injuries[target], strain[target], last_hit[target], applied[target] = nil, nil, nil, nil
+end
+
 -- Everything off (the setting was switched off): what was sent must go back to 1.
 function M.clear_all()
     for _, list in pairs(injuries) do for part in pairs(list) do list[part] = nil end end

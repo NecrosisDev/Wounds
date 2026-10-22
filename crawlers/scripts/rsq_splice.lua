@@ -51,7 +51,11 @@ function M.splice(data, clips)
         out[#out + 1] = string.pack("<I4I4", tag, #body) .. body
         q = q + 8 + size
     end
-    if not first then return nil, "no clip chunk" end
+    if not first then
+        -- What arrived, for the log: the size, the first bytes and the chunks walked.
+        return nil, string.format("no clip chunk (%d bytes, %d chunks, starts %s)", #data, #out,
+            (data:sub(1, 16):gsub(".", function(c) return string.format("%02x", c:byte()) end)))
+    end
     return table.concat(out), first
 end
 

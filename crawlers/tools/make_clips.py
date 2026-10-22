@@ -360,6 +360,7 @@ import json  # noqa: E402
 TICKS_PER_SECOND = 1000.0 / 12.0
 MOCAP = Path(__file__).resolve().parents[1] / "mocap-src" / "zombie-crawl.fbx"
 MOCAP_CACHE = Path(__file__).with_name("mocap_crawl.json")
+NECK_LIMIT = 35.0                    # degrees the one-piece neck may bend from straight (see limit_neck)
 HEAD_KEEP = 0.35                     # how much of the captured head pose is kept over the look at the target
 MOCAP_KEYS = 16                      # the most keys a clip gets: a few more than the game's own clips (10)
 
@@ -410,6 +411,9 @@ def retarget(world):
     # The captured zombie hangs its head at the floor; it keeps that sway but lifts most of the way toward
     # the target and levels its ears (Hunter: the chest and eyes face the target).
     look(key, 0.0, captured=HEAD_KEEP)
+    limit_neck(key, NECK_LIMIT)
+    level_ears(key)                                        # cutting the bend short can tip the ears again
+    limit_neck(key, NECK_LIMIT)
     for side, (shoulder, humerus, forearm, hand), cap in (("right", (11, 12, 13, 17), "Right"), ("left", (14, 15, 16, 18), "Left")):
         aim(key, shoulder, humerus, d(cap + "Shoulder", cap + "Arm"))
         aim(key, humerus, forearm, d(cap + "Arm", cap + "ForeArm"))
@@ -459,6 +463,31 @@ def _pick_keys(frames, count):
             break
         keys.append(at)
     return sorted(keys)
+
+
+def level_ears(key):
+    R = transforms(key)[10][0]
+    face, ears = vm(FACE, R), vm(EARS, R)
+    lean = math.asin(max(-1, min(1, ears[1])))
+    sign = 1 if dot(cross(face, ears), UP) >= 0 else -1
+    turn(key, 10, face, -sign * max(-0.6, min(0.6, lean)))
+
+
+def limit_neck(key, degrees):
+    """The neck and head are one rigid part: bent far from straight it juts out of the chest as a lump
+    (Hunter 13:37). Keep its bend from the standing neck within `degrees` (the capture itself stays within
+    about 30), giving up the rest of the look toward the target."""
+    q, n = to_quat(local(key, 10)), to_quat(NECK_IDLE)
+    d = sum(a * b for a, b in zip(q, n))
+    if d < 0:
+        q, d = [-x for x in q], -d
+    angle = 2 * math.acos(min(1.0, d))
+    if angle <= math.radians(degrees):
+        return
+    t = math.radians(degrees) / angle                     # slerp from straight toward the look, cut short
+    th = math.acos(min(1.0, d))
+    w = [(math.sin((1 - t) * th) * a + math.sin(t * th) * b) / math.sin(th) for a, b in zip(n, q)]
+    set_local(key, 10, rsq.quat_to_rot(tuple(x / math.sqrt(sum(y * y for y in w)) for x in w)))
 
 
 def crawl_keys():
