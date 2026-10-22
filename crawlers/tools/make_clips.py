@@ -125,8 +125,8 @@ assert max(abs(x - y) for x, y in zip(rsq.quat_to_rot(to_quat(_probe)), _probe))
 # ---------------------------------------------------------------- posing on a key
 
 
-def transforms(key):
-    track = rsq.Track(0, [0.0], [BASE_ROOT], [[tuple(b) for b in key]])
+def transforms(key, root=None):
+    track = rsq.Track(0, [0.0], [root or BASE_ROOT], [[tuple(b) for b in key]])
     return rsq.pose_transforms(seq, track, 0)
 
 
@@ -213,33 +213,53 @@ def body(arch=40.0, lift=12.0, head=25.0, yaw=0.0, roll=0.0, hips=0.0):
     return key
 
 
-def look(key, raise_by):
+def look(key, raise_by, captured=0.0):
     """The neck: straight on the chest as when standing (the lying pose has it turned so the cheek is on
     the floor), then turned on its own axis back toward the target and tipped back about its own ear-to-ear
-    line until the face looks `raise_by` degrees above level. Never a roll toward a shoulder."""
-    set_local(key, 10, NECK_IDLE)
+    line until the face looks `raise_by` degrees above level. Never a roll toward a shoulder.
+    With `captured` > 0 the neck already holds a captured pose: it still turns toward the target and
+    levels its ears fully, but tips up only (1 - captured) of the way, so the captured nod survives."""
+    share = 1.0 - captured
+    passes = 3 if captured == 0 else 1
+    if captured == 0:
+        set_local(key, 10, NECK_IDLE)
     R = transforms(key)[10][0]
     axis = vm(NECK_AXIS, R)
     face = vm(FACE, R)
     flat = lambda v: norm(add(v, scale(axis, -dot(v, axis))))
     a, b = flat(face), flat(FORWARD)
     turn_by = math.atan2(dot(cross(a, b), axis), dot(a, b))
-    turn(key, 10, axis, max(-0.9, min(0.9, turn_by * 0.8)))
+    reach = 1.3 if captured else 0.9                         # a neck turns about 75 degrees each way
+    turn(key, 10, axis, max(-reach, min(reach, turn_by * (1.0 if captured else 0.8))))   # eyes on the target
     R = transforms(key)[10][0]
     face, ears = vm(FACE, R), vm(EARS, R)
-    for _ in range(3):                                    # the neck leans against the chest's roll: ears level
-        lean = math.asin(max(-1, min(1, ears[1])))
+    for _ in range(3):                                    # the neck leans against the chest's roll: ears level,
+        lean = math.asin(max(-1, min(1, ears[1])))        # always fully (Hunter: never scrunched to a shoulder)
         sign = 1 if dot(cross(face, ears), UP) >= 0 else -1
         turn(key, 10, face, -sign * max(-0.6, min(0.6, lean)))
         R = transforms(key)[10][0]
         face, ears = vm(FACE, R), vm(EARS, R)
     want = math.radians(raise_by)
-    for _ in range(3):                                    # the tip about the ear line that levels the face
+    for _ in range(passes):                               # the tip about the ear line that levels the face
         tip = math.asin(max(-1, min(1, math.sin(want)))) - math.asin(max(-1, min(1, face[1])))
         sign = 1 if dot(cross(face, UP), ears) >= 0 else -1
-        turn(key, 10, ears, sign * max(-1.2, min(1.2, tip)))
+        turn(key, 10, ears, sign * max(-1.2, min(1.2, tip * share)))
         R = transforms(key)[10][0]
         face, ears = vm(FACE, R), vm(EARS, R)
+    if captured:
+        # A neck lying forward turns the face sideways mostly by bending to the side: swing the face about
+        # the vertical onto the target, then level the ears again.
+        for _ in range(2):
+            flat_face = norm([face[0], 0.0, face[2]])
+            swing = math.atan2(dot(cross(flat_face, FORWARD), UP), dot(flat_face, FORWARD))
+            turn(key, 10, UP, max(-1.0, min(1.0, swing)))
+            R = transforms(key)[10][0]
+            face, ears = vm(FACE, R), vm(EARS, R)
+            lean = math.asin(max(-1, min(1, ears[1])))
+            sign = 1 if dot(cross(face, ears), UP) >= 0 else -1
+            turn(key, 10, face, -sign * max(-0.6, min(0.6, lean)))
+            R = transforms(key)[10][0]
+            face, ears = vm(FACE, R), vm(EARS, R)
 
 
 # ---------------------------------------------------------------- the clips
@@ -327,38 +347,134 @@ def keyed(*frames):
     return out
 
 
-# ---- the crawl: an army crawl. Each hand plants far ahead, stays planted while the body is dragged up to
-# it (in the clip the body stays put, so the planted hand slides back at the drag speed), then lifts and
-# swings forward again. The same side's knee draws up to push while that hand swings; the shoulder on the
-# swinging side rises, the chest bends toward it and the hips swing the other way; the chest surges up on
-# each pull and the head steadies on the target with a little lag.
-CRAWL_TICKS, CRAWL_STEP = 120, 10           # one cycle, both hands; keys 10 ticks apart like the game's Walk
-STANCE = 0.65                                # the part of a cycle a hand is planted
+# ---- the crawl: Mixamo's "Zombie Crawl" motion capture (Hunter's download, 2026-10-22), retargeted onto
+# the game's 18 parts by direction: each part is turned so it points where the matching captured bone
+# points; the hips and head take the captured frame (hip line and spine, neck axis and face). The capture
+# crawls along its own +Z; that is turned onto FORWARD (toward the target). The body is not moved here:
+# the clip plays in place and the addon drags the body (characters.drift) at the capture's own speed
+# (config crawl_speed). The raw download is never shipped or committed (mocap-src/ is git-ignored);
+# the retargeted keys are cached beside this file so the clips rebuild without it.
+import importlib.util  # noqa: E402
+import json  # noqa: E402
+
 TICKS_PER_SECOND = 1000.0 / 12.0
-SLIDE = 35.0 * STANCE * CRAWL_TICKS / TICKS_PER_SECOND   # cm: config crawl_speed over one plant
-PLANT, PLANT_OUT = 52.0, 10.0
+MOCAP = Path(__file__).resolve().parents[1] / "mocap-src" / "zombie-crawl.fbx"
+MOCAP_CACHE = Path(__file__).with_name("mocap_crawl.json")
+HEAD_KEEP = 0.35                     # how much of the captured head pose is kept over the look at the target
+MOCAP_KEYS = 16                      # the most keys a clip gets: a few more than the game's own clips (10)
 
 
-def hand_phase(u):
-    """(forward, out, up), elbow hint for a hand planting at u = 0."""
-    u %= 1.0
-    if u < STANCE:
-        return (PLANT - SLIDE * u / STANCE, PLANT_OUT, 0.0), PROPPED
-    s = (u - STANCE) / (1 - STANCE)
-    e = s * s * (3 - 2 * s)
-    arc = math.sin(math.pi * s)
-    elbow = tuple(a + (b - a) * arc for a, b in zip(PROPPED, (0.2, 0.8, 0.6)))
-    return (PLANT - SLIDE + SLIDE * e, PLANT_OUT + 4 * arc, 10.0 * arc), elbow
+def _fbx():
+    spec = importlib.util.spec_from_file_location("fbx_anim", Path(__file__).with_name("fbx_anim.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def crawl_key(tick):
-    u = tick / CRAWL_TICKS
-    sway = math.cos(2 * math.pi * (u - (STANCE + 1) / 2))        # +1 mid right swing, -1 mid left swing
-    surge = math.sin(4 * math.pi * u)
-    (r, er), (l, el) = hand_phase(u), hand_phase(u + 0.5)
-    return pose(dict(arch=58 + 5 * surge, lift=14 + 3 * surge, head=12 + 3 * math.sin(4 * math.pi * u - 0.6),
-                     yaw=8 * sway, roll=12 * sway, hips=-5 * sway, right=r, left=l, eright=er, eleft=el,
-                     kright=0.35 * (1 + sway), kleft=0.35 * (1 - sway)))
+def _basis(a, b):
+    """Rows of an orthonormal basis from a primary direction `a` and a secondary `b`."""
+    x = norm(a)
+    z = norm(cross(x, b))
+    y = cross(z, x)
+    return (x, y, z)
+
+
+def _rotation(local_pair, world_pair):
+    """Row-form R with local_pair[i] * R along world_pair[i] (the first exactly, the second in its plane)."""
+    A, B = _basis(*local_pair), _basis(*world_pair)
+    return tuple(sum(A[k][i] * B[k][j] for k in range(3)) for i in range(3) for j in range(3))
+
+
+def _set_world(key, bone, R):
+    parent = by_index[bone].parent
+    T = transforms(key)
+    P = T[parent][0] if parent in T else (1, 0, 0, 0, 1, 0, 0, 0, 1)
+    set_local(key, bone, mm(R, tr(P)))
+
+
+def retarget(world):
+    """One key from the captured bones' positions and head frame (already turned into the game's axes)."""
+    P = lambda name: world[name][0]
+    d = lambda a, b: add(P(b), scale(P(a), -1))
+    key = [list(b) for b in BASE_KEY]
+    hips_local = (add(list(by_index[2].translation), scale(list(by_index[5].translation), -1)), list(by_index[8].translation))
+    _set_world(key, 1, _rotation(hips_local, (d("LeftUpLeg", "RightUpLeg"), d("Hips", "Spine"))))
+    aim(key, 8, 9, d("Spine", "Spine2"))
+    aim(key, 9, 10, d("Spine2", "Neck"))
+    T = transforms(key)                                    # the chest's twist: the shoulder line as captured
+    axis = norm(d("Spine2", "Neck"))
+    flat = lambda v: norm(add(v, scale(axis, -dot(v, axis))))
+    a, b = flat(add(list(T[12][1]), scale(list(T[15][1]), -1))), flat(d("LeftArm", "RightArm"))
+    turn(key, 9, axis, math.atan2(dot(cross(a, b), axis), dot(a, b)))
+    _set_world(key, 10, _rotation((NECK_AXIS, FACE), (d("Neck", "Head"), world["Head"][1])))
+    # The captured zombie hangs its head at the floor; it keeps that sway but lifts most of the way toward
+    # the target and levels its ears (Hunter: the chest and eyes face the target).
+    look(key, 0.0, captured=HEAD_KEEP)
+    for side, (shoulder, humerus, forearm, hand), cap in (("right", (11, 12, 13, 17), "Right"), ("left", (14, 15, 16, 18), "Left")):
+        aim(key, shoulder, humerus, d(cap + "Shoulder", cap + "Arm"))
+        aim(key, humerus, forearm, d(cap + "Arm", cap + "ForeArm"))
+        aim(key, forearm, hand, d(cap + "ForeArm", cap + "Hand"))
+    for (hip, knee, foot), cap in (((2, 3, 4), "Right"), ((5, 6, 7), "Left")):
+        aim(key, hip, knee, d(cap + "UpLeg", cap + "Leg"))
+        aim(key, knee, foot, d(cap + "Leg", cap + "Foot"))
+    return key
+
+
+def _capture():
+    """[(seconds, {bone: (position, face)})] at 30 a second over the whole take, in the game's axes,
+    plus the take's length and its speed along its own +Z."""
+    fbx = _fbx()
+    sk = fbx.Skeleton(MOCAP.read_bytes())
+    yaw = math.atan2(FORWARD[0], FORWARD[2])               # the capture's +Z onto FORWARD
+    c, s = math.cos(yaw), math.sin(yaw)
+    turn_y = lambda v: [c * v[0] + s * v[2], v[1], -s * v[0] + c * v[2]]
+    frames = []
+    count = int(sk.length * 30)
+    for i in range(count + 1):
+        t = sk.length * i / count
+        W = sk.sample(t)
+        frames.append((t, {n: (turn_y(fbx.position(m)), turn_y([m[0][2], m[1][2], m[2][2]])) for n, m in W.items()}))
+    travel = frames[-1][1]["Hips"][0]
+    start = frames[0][1]["Hips"][0]
+    speed = dot(add(travel, scale(start, -1)), FORWARD) / sk.length
+    return frames, sk.length, speed
+
+
+def _pick_keys(frames, count):
+    """The frames that keep the motion best: greedily add the frame worst predicted by blending its
+    neighbouring keys (hands, feet, head and elbows relative to the hips), first and last always kept."""
+    parts = ("RightHand", "LeftHand", "RightFoot", "LeftFoot", "Head", "RightForeArm", "LeftForeArm", "Spine2")
+    rel = [[x for p in parts for x in add(f[p][0], scale(f["Hips"][0], -1))] for _, f in frames]
+    keys = [0, len(frames) - 1]
+    while len(keys) < count:
+        worst, at = -1.0, None
+        ks = sorted(keys)
+        for a, b in zip(ks, ks[1:]):
+            for i in range(a + 1, b):
+                u = (i - a) / (b - a)
+                e = sum((rel[i][k] - (rel[a][k] + (rel[b][k] - rel[a][k]) * u)) ** 2 for k in range(len(rel[i])))
+                if e > worst:
+                    worst, at = e, i
+        if at is None:
+            break
+        keys.append(at)
+    return sorted(keys)
+
+
+def crawl_keys():
+    if MOCAP.exists():
+        frames, length, speed = _capture()
+        picked = _pick_keys(frames, MOCAP_KEYS)
+        # The root is the pelvis position (the game's Idle has it at standing hip height, the lying poses
+        # near the floor); the capture's hip height goes in, the lying pose's floor spot stays.
+        root = lambda f: [BASE_ROOT[0], f["Hips"][0][1], BASE_ROOT[2]]
+        keys = [(round(frames[i][0] * TICKS_PER_SECOND), retarget(frames[i][1]), root(frames[i][1])) for i in picked]
+        keys[-1] = (keys[-1][0], [list(b) for b in keys[0][1]], list(keys[0][2]))   # the take loops: end on the first key
+        MOCAP_CACHE.write_text(json.dumps({"source": "Mixamo Zombie Crawl, retargeted by make_clips.py",
+                                           "seconds": length, "speed_cm_s": speed, "keys": keys}))
+        print(f"crawl: {len(keys)} keys from {length:.2f} s of capture, travel {speed:.1f} cm/s")
+    data = json.loads(MOCAP_CACHE.read_text())
+    return [(t, [list(b) for b in k], tuple(r)) for t, k, r in data["keys"]]
 
 
 # ---- the grab: a coil (anticipation), a lunge that overshoots, a clutch, a haul down and a settle.
@@ -394,7 +510,7 @@ SWIPE = keyed(
 
 # (name, flags, [(ticks, key)]); 1 loops. Ticks: 83 a second.
 CLIPS = [
-    ("Ground Crawl", 1, [(t, crawl_key(t)) for t in range(0, CRAWL_TICKS + 1, CRAWL_STEP)]),
+    ("Ground Crawl", 1, crawl_keys()),
     ("Ground Grab", 0, GRAB),
     ("Ground Swipe", 0, SWIPE),
 ]
@@ -406,11 +522,11 @@ def encode():
         assert len(name) <= 15
         out += name.encode("latin-1").ljust(16, b"\0") + struct.pack("<II", 0, 0)
         out += struct.pack("<iI", len(keys), flags)
-        out += struct.pack(f"<{len(keys)}f", *[float(t) for t, _ in keys])
-        for _ in keys:
-            out += struct.pack("<3f", *BASE_ROOT)
-        for _, key in keys:
-            for b in key:
+        out += struct.pack(f"<{len(keys)}f", *[float(k[0]) for k in keys])
+        for k in keys:   # (tick, key) or (tick, key, root): the root is the pelvis position
+            out += struct.pack("<3f", *(k[2] if len(k) > 2 else BASE_ROOT))
+        for k in keys:
+            for b in k[1]:
                 out += struct.pack("<5f", *b)
     return bytes(out)
 
@@ -435,8 +551,9 @@ if CHECK:
         for other in s2.sets[1:]:
             assert len(seq.clips) + i not in other.tracks
     for name, flags, keys in CLIPS:
-        for tick, key in keys:
-            T = transforms(key)
-            assert all(T[b][1][1] > -4.0 for b in T), (name, tick)   # no bone centre through the floor (the lying pose itself has a hand at -2)
-            assert T[10][1][1] > 22.0, (name, tick)                       # the chest and head up off the floor
-    print("check: splice re-reads,", len(s2.clips), "clips; chest raised, nothing through the floor; other sets unchanged")
+        for k in keys:
+            T = transforms(k[1], k[2] if len(k) > 2 else None)
+            low = min(T[b][1][1] for b in T)
+            assert low > -4.0, (name, k[0], low)        # no bone centre through the floor (the lying pose itself has a hand at -2)
+            assert T[10][1][1] > 10.0, (name, k[0])      # the neck off the floor (the captured crawl drops it near 15)
+    print("check: splice re-reads,", len(s2.clips), "clips; neck up, nothing through the floor; other sets unchanged")

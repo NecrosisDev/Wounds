@@ -291,14 +291,15 @@ target gets an overhead, beyond 0.8 x reach a thrust or overhead by `char+1204`,
 2.2), then picks the motion (`157240`/`157700` 5-10, `157DC0` Stab, `157BF0` Overhead; KB 3044-3050) and
 plays it with `179EE0` (no state gate, KB 3061-3083).
 
-**Why it does nothing downed.** `B4570` returns at once while `char+DF4 & 0x800` (AI.md:55-57), so engage
-never runs for a knocked-down NPC. Open conflict for the reviewer: AI_BRAIN.md:208 calls 0x200 down;
-AI.md:57 and KB 3168 use 0x800. Confirm which bit a knockdown (and keep_down, section 7) sets.
+**Downed state (corrected by the Lua thread, 13:29).** The down bit is `+DF4 & 0x200`; 0x800 is the limp
+ragdoll state, which is what `B4570`'s early return tests (AI.md:55-57). So the think loop already runs
+for a downed character, and what keeps a downed NPC from attacking is in engage or the dispatcher, not
+the loop.
 
 **Ask.** For a character the addon marks as a ground fighter (`characters.ground_fighter(row, on)`,
 capability `characters.ground_brain`), and only while it is down and kept down (section 7):
-1. Let the think loop run engage for it despite the down bit (a detour on `B4570`'s early return,
-   scoped to marked characters).
+1. Make sure engage reaches the attack decision for it while down (the loop runs; whether engage or
+   `AE9D0` refuses a downed attacker is untraced).
 2. In the dispatcher, after the native gates pass, swap the chosen motion for a served ground clip:
    a side swing becomes "Ground Swipe" (mirrored by `ai+1BC`; a left-hand clip will be added), a thrust
    or overhead becomes "Ground Grab". Everything else stays native: when, stamina, cooldown, skill, side,

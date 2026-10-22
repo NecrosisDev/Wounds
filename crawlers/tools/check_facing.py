@@ -59,7 +59,8 @@ for index in range(48, len(seq.clips)):
         ears = vm(EARS, rsq.pose_transforms(seq, track, key)[10][0])   # head tipped toward a shoulder?
         tilt = abs(ears[1])
         look_forward = sum(face[i] * forward[i] for i in range(3))
-        ok = hips[1] < -0.3 and chest[1] < 0.2 and look_forward > 0.5 and -0.5 < face[1] < 0.7 and tilt < 0.26
+        # Hips face down, not on their side: the captured crawl rolls them up to about 80 degrees from flat.
+        ok = hips[1] < -0.15 and chest[1] < 0.2 and look_forward > 0.5 and -0.5 < face[1] < 0.7 and tilt < 0.26
         print(f"{seq.clips[index].name:13} key {key}: hips y {hips[1]:+.2f}, chest y {chest[1]:+.2f}, "
               f"face forward {look_forward:+.2f} y {face[1]:+.2f}, ear tilt {math.degrees(math.asin(min(1, tilt))):4.1f} deg {'ok' if ok else 'WRONG'}")
         failures += not ok
