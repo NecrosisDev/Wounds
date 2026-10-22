@@ -10,3 +10,19 @@ __pycache__/
 /excamera-work/
 # Mixamo downloads: their license forbids redistributing the raw files; only the converted clips.bin ships
 /crawlers/mocap-src/
+
+# Kept on disk, not published: development notes, tests and tools that do not build the mod
+/DISMEMBER-PLAN.md
+/RUNTIME-REQUESTS.md
+/tools/
+/test_injuries.py
+/tests/
+/crawlers/test_crawlers.py
+/crawlers/tests/
+/crawlers/tools/check_facing.py
+/crawlers/tools/make_clips_v1.py
+/crawlers/tools/render_clips.py
+/crawlers/tools/splice.py
+/crawlers/tools/mocap_crawl.json
+/crawlers/preview/
+/crawlers/preview_tmp.png
