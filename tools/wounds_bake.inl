@@ -689,6 +689,7 @@ constexpr unsigned woundBandSamples = 96;
 struct WoundSeverMesh {
     uintptr_t node = 0, actor = 0;
     uint32_t bits = 0;
+    ULONGLONG usedAt = 0;             // the last draw that asked for it; the caps skip entries not drawn lately
     std::vector<unsigned char> faces; // by face index (+0x290)
     struct Ring {
         int bit = -1, parentBone = -1, topBone = -1, farBone = -1; // far: the hand or foot, to face the end away from
@@ -770,15 +771,22 @@ static bool woundSeverBuild(uintptr_t node, uintptr_t actor, uint32_t bits, Woun
 }
 
 // The mesh's split for this draw, cached; null when the character has nothing severed.
+// Out of line: the caps pass below uses __try, so it may not build a temporary with a destructor itself.
+static void woundSeverDrop(WoundSeverMesh& s) { s = {}; }
+
+// Keyed by mesh node, actor and bits together: a node or actor pointer freed with an arena round and
+// reused for a new body never matches an old entry.
 static const WoundSeverMesh* woundSeverOf(uintptr_t node, uintptr_t actor) {
     const uint32_t bits = woundSeveredBits(actor) & 0xFF;
     if (!bits) return nullptr;
-    for (const WoundSeverMesh& s : woundSeverMeshes)
-        if (s.node == node && s.bits == bits) return &s;
+    const ULONGLONG now = GetTickCount64();
+    for (WoundSeverMesh& s : woundSeverMeshes)
+        if (s.node == node && s.actor == actor && s.bits == bits) { s.usedAt = now; return &s; }
     static unsigned next = 0;
     WoundSeverMesh& slot = woundSeverMeshes[next];
     next = (next + 1) % 4;
     if (!woundSeverBuild(node, actor, bits, slot)) { slot = {}; return nullptr; }
+    slot.usedAt = now;
     return &slot;
 }
 
@@ -786,9 +794,15 @@ static const WoundSeverMesh* woundSeverOf(uintptr_t node, uintptr_t actor) {
 // disc through the ring's centre facing away from the bone's own centre. woundLock held.
 static void woundSeveredCaps(const float* view, WoundUniforms& out) {
     out.caps = 0;
-    for (const WoundSeverMesh& s : woundSeverMeshes) {
-        if (!s.node || !(woundSeveredBits(s.actor) & s.bits)) continue;
+    const ULONGLONG clock = GetTickCount64();
+    for (WoundSeverMesh& s : woundSeverMeshes) {
+        if (!s.node) continue;
+        // Only an entry a draw used in the last half second, whose actor still carries those bits: a body
+        // freed between arena rounds stops being drawn, and its entry is dropped before anything is read.
+        if (clock - s.usedAt > 500 || !(woundSeveredBits(s.actor) & s.bits)) { woundSeverDrop(s); continue; }
         __try {
+            if (!readable(s.node, field::sceneNode::parent + 8) ||
+                *(const uintptr_t*)(s.node + field::sceneNode::parent) != s.actor) { s.node = 0; continue; }
             WoundSkinMesh m;
             if (!woundSkinMesh(s.node, m)) continue;
             float sectorOrigin[3]{};

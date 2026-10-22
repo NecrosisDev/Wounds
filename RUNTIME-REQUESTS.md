@@ -314,3 +314,30 @@ that cannot stand (it may want to back off or circle). Each is a live write and 
 static decompile review (`work\verification\*-review.md`).
 
 Until this lands the addon keeps its own timer.
+
+# 10. Slashes and overhead blows that lodge in flesh, like stabs (Hunter 13:43)
+
+Static reading of `work/probes/decomp-all.c` (no game run); constants read from the installed EXE.
+
+**How a weapon lodges.** `FUN_10015CE20` (decomp 193979) appends a 0x68-byte ball-joint row
+(flags 0x11000 or 0x211000) to the weapon body's joint array (weapon = attacker +0xC38, count +0x31C,
+base +0x320), anchored to the victim part (row +0x30). Slack (+0x20) and a pull-out budget (+0x28,
+from weapon +0x444 and depth) scale with the blow. `FUN_100089D80` drains the budget each solve and
+frees the row at its threshold (85392-85418, removal 85532-85545).
+
+**Why only stabs lodge.** The call (193766) is not gated on attack type:
+`if (0.1 < local_98 && (attacker +0x1068 & 0x30) != 0) FUN_10015CE20(...)`. It is magnitude:
+the stab path adds thrust power into `local_98` (193465-193488); the swing path ends with
+`local_98 = local_98 * DAT_10031BE98` (193557), and that constant is the float **0.5**, so a swing
+reaches the 0.1 bar (`DAT_10031BF38`, double 0.1) only at twice the depth. Motion 0x80 (grab) zeroes it
+(193571). Victim `+0xDF8 & 0x400` must be clear (193739; meaning untraced).
+
+**Ask.** `characters.lodge_swings(factor)` or a manifest setting (capability `combat.lodge`): at the one
+multiply at 193557, use `factor` (0.5 native .. 1.5) instead of the shared constant. Do not patch
+`DAT_10031BE98` itself: other code reads it (the `FUN_10015D0B0` call at 193763 and the expression at
+193550). A one-instruction operand redirect to the runtime's own float, or a detour of the swing branch.
+Injuries would set about 1.0 (a swing lodges at the same depth as a stab).
+
+Unknowns for the review: whether armour has already reduced `local_98` before 193766 (if not, edges
+would lodge in plate); how often a full swing passes the bar at 1.0; whether the pull-free budget feels
+right for edges; what `+0xDF8 & 0x400` blocks. Needs its own static decompile review.
